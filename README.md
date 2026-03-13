@@ -1,14 +1,16 @@
-# ESP32 GPS Logger with IMU
+   # ESP32 GPS Logger with IMU
 
 A comprehensive GPS tracking system with acceleration logging, designed for ESP32 with SD card storage.
 
 ## Features
 
 - **GPS Tracking**: Neo-6M GPS module for location, altitude, and speed data
-- **IMU Data**: MPU6050 6-axis accelerometer and gyroscope
+- **IMU Data**: MPU6050/MPU6500/MPU9250 6-axis accelerometer and gyroscope
 - **Real-Time Clock**: DS3231 RTC for accurate timestamps when offline
+- **LCD Display** (Optional): LCD1602A shows live GPS, IMU, time, and IP address
+- **Button Control**: Toggle LCD display modes with BOOT button
 - **SD Card Storage**: Unlimited capacity with date-based CSV files
-- **HTTP Server**: Web interface for file listing and download
+- **HTTP Server**: Web  interface for file listing and download
 - **WiFi Connectivity**: Automatic time synchronization via NTP
 - **Low Power**: Optimized for battery operation
 
@@ -27,13 +29,24 @@ A comprehensive GPS tracking system with acceleration logging, designed for ESP3
 
 - **RTC**: DS3231 Real-Time Clock
   - I2C Address: 0x68
+  - I2C Bus: I2C_NUM_0 (shared with IMU)
   - SDA: GPIO 18
   - SCL: GPIO 19
 
-- **IMU**: MPU6050 6-Axis IMU
+- **IMU**: MPU6050/MPU6500/MPU9250 6-Axis IMU
   - I2C Address: 0x69 (AD0 HIGH) or 0x68 (AD0 LOW)
-  - SDA: GPIO 18 (shared with RTC)
-  - SCL: GPIO 19 (shared with RTC)
+  - I2C Bus: I2C_NUM_0 (shared with RTC)
+  - SDA: GPIO 18
+  - SCL: GPIO 19
+  - Auto-detects compatible sensors
+
+- **LCD** (Optional): LCD1602A with I2C backpack
+  - I2C Address: 0x27 or 0x3F
+  - I2C Bus: I2C_NUM_1 (dedicated - no bus contention!)
+  - SDA: GPIO 32
+  - SCL: GPIO 33
+  - Displays GPS fix, speed, altitude, and IMU data
+  - Updates every second with smooth, stable text
 
 ### SD Card
 - SDMMC interface (1-bit mode)
@@ -49,11 +62,14 @@ A comprehensive GPS tracking system with acceleration logging, designed for ESP3
 |-----------|-----|------|
 | GPS RX | GPIO 22 | Input from GPS TX |
 | GPS TX | GPIO 23 | Output to GPS RX |
-| I2C SDA | GPIO 18 | RTC + MPU6050 |
-| I2C SCL | GPIO 19 | RTC + MPU6050 |
+| I2C Bus 0 SDA | GPIO 18 | RTC + IMU |
+| I2C Bus 0 SCL | GPIO 19 | RTC + IMU |
+| I2C Bus 1 SDA | GPIO 32 | LCD (dedicated) |
+| I2C Bus 1 SCL | GPIO 33 | LCD (dedicated) |
 | SD CMD | GPIO 15 | SD Card |
 | SD CLK | GPIO 14 | SD Card |
 | SD D0 | GPIO 2 | SD Card |
+| Button | GPIO 0 | BOOT button (built-in) |
 
 ## WiFi Configuration
 
@@ -123,6 +139,20 @@ Important settings:
 3. Updates RTC with current time from NTP
 4. Begins GPS logging
 
+### LCD Display Modes
+If LCD1602A is connected, press the **BOOT button** (GPIO 0) to toggle between display modes:
+
+**Mode 1: GPS/IMU Data**
+- Line 1: Speed (km/h) and Altitude (m)
+- Line 2: Latitude, Longitude (with GPS fix)
+- Line 2: Accelerometer X,Y,Z (without GPS fix)
+
+**Mode 2: Time and IP Address**
+- Line 1: Current time (HH:MM:SS)
+- Line 2: WiFi IP address
+
+The button has built-in debouncing (300ms) to prevent accidental double-presses.
+
 ### GPS Logging
 - Logs valid GPS fixes with IMU data every second
 - Creates new file each day at midnight
@@ -158,12 +188,20 @@ Files are automatically organized by date. To download files:
 - Verify I2C address is 0x68
 - Ensure pull-up resistors present (usually internal)
 
-### MPU6050 Not Found
+### MPU6050/6500/9250 Not Found
 - Check I2C connections (shared with RTC)
 - Verify AD0 pin state:
   - AD0 HIGH (3.3V) = address 0x69
   - AD0 LOW (GND) = address 0x68
 - Ensure RTC is working first (same I2C bus)
+- Code auto-detects MPU6050, MPU6500, and MPU9250 variants
+
+### LCD1602A Not Working (Optional)
+- Verify I2C backpack is installed on LCD
+- Check I2C connections (shared with RTC and IMU)
+- Code tries addresses 0x27 and 0x3F automatically
+- If not found, system continues without LCD
+- Adjust contrast potentiometer on I2C backpack if display is blank
 
 ### WiFi Connection Failed
 - Verify SSID and password
@@ -177,6 +215,7 @@ The system is designed for portable operation:
 - GPS: ~50mA active
 - IMU: ~3.9mA active
 - RTC: ~200µA (continues on backup battery)
+- LCD: ~30mA with backlight, ~5mA without
 - SD Card: ~100mA during writes, <1mA idle
 - ESP32: ~240mA active, can be reduced with sleep modes
 
@@ -189,4 +228,4 @@ This project is based on ESP-IDF examples and is provided as-is for educational 
 - ESP-IDF framework by Espressif Systems
 - NMEA parsing for GPS data
 - DS3231 RTC driver
-- MPU6050 IMU driver
+- MPU6050/MPU6500/MPU9250 IMU driver

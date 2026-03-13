@@ -3,7 +3,7 @@
  * 
  * Features:
  * - GPS tracking with Neo-6M module
- * - IMU data logging with MPU6050
+ * - IMU data logging with MPU6050/MPU6500/MPU9250
  * - RTC timekeeping with DS3231
  * - SD card storage with daily CSV files
  * - WiFi connectivity and NTP sync
@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -29,15 +30,16 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "rom/ets_sys.h"
 
 // WiFi Configuration - EDIT THESE
-#define WIFI_SSID "Internal"
-#define WIFI_PASSWORD "CasCade2023!"
+#define WIFI_SSID "Zero Gravitas"
+#define WIFI_PASSWORD "ILoveLydia!"
 
 // Timezone Configuration - EDIT THIS
 // Common timezones:
@@ -60,12 +62,20 @@
 #define I2C_SCL_PIN         19
 #define I2C_FREQ_HZ         100000
 
+#define LCD_I2C_NUM         I2C_NUM_1
+#define LCD_I2C_SDA_PIN     32
+#define LCD_I2C_SCL_PIN     33
+#define LCD_I2C_FREQ_HZ     100000  // Dedicated bus for LCD
+
 #define RTC_I2C_ADDR        0x68
 #define MPU6050_I2C_ADDR    0x69  // AD0 HIGH, use 0x68 if AD0 LOW
+#define LCD_I2C_ADDR        0x27  // LCD1602A with I2C backpack, try 0x3F if not found
 
 #define SD_CMD_PIN          15
 #define SD_CLK_PIN          14
 #define SD_D0_PIN           2
+
+#define BUTTON_GPIO         0    // BOOT button on most ESP32 boards
 
 // SD Card Mount Point
 #define MOUNT_POINT "/sdcard"
@@ -85,6 +95,10 @@ static bool time_synced = false;
 static bool timezone_set_from_gps = false;
 static sdmmc_card_t *card = NULL;
 static httpd_handle_t server = NULL;
+
+// Display mode control
+static volatile uint8_t display_mode = 0; // 0 = GPS/IMU, 1 = Time/IP
+static volatile uint32_t last_button_time = 0;
 
 // GPS Data Structure
 typedef struct {
@@ -172,52 +186,416 @@ static const char* get_timezone_from_gps(float latitude, float longitude)
 
 /* ==================== I2C Functions ==================== */
 
+static i2c_master_bus_handle_t i2c_bus0 = NULL;
+static i2c_master_bus_handle_t i2c_bus1 = NULL;
+static i2c_master_dev_handle_t i2c_dev_rtc = NULL;
+static i2c_master_dev_handle_t i2c_dev_imu = NULL;
+static i2c_master_dev_handle_t i2c_dev_lcd = NULL;
+
 static esp_err_t i2c_master_init(void)
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    // Initialize I2C_NUM_0 for IMU and RTC
+    i2c_master_bus_config_t bus0_cfg = {
+        .i2c_port = I2C_MASTER_NUM,
         .sda_io_num = I2C_SDA_PIN,
         .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    esp_err_t ret = i2c_new_master_bus(&bus0_cfg, &i2c_bus0);
+    if (ret != ESP_OK) return ret;
+
+    // Pre-create RTC device handle (fixed address)
+    i2c_device_config_t rtc_dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = RTC_I2C_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    ret = i2c_master_bus_add_device(i2c_bus0, &rtc_dev_cfg, &i2c_dev_rtc);
+    if (ret != ESP_OK) return ret;
+
+    // Initialize I2C_NUM_1 for LCD (separate bus - no contention!)
+    i2c_master_bus_config_t bus1_cfg = {
+        .i2c_port = LCD_I2C_NUM,
+        .sda_io_num = LCD_I2C_SDA_PIN,
+        .scl_io_num = LCD_I2C_SCL_PIN,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    return i2c_new_master_bus(&bus1_cfg, &i2c_bus1);
+}
+
+static void i2c_scan(void)
+{
+    ESP_LOGI(TAG, "Scanning I2C Bus 0 (IMU/RTC)...");
+    int devices_found = 0;
+
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        if (i2c_master_probe(i2c_bus0, addr, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "  Bus 0: Found device at 0x%02X", addr);
+            devices_found++;
+        }
+    }
+
+    if (devices_found == 0) {
+        ESP_LOGW(TAG, "  Bus 0: No I2C devices found!");
+    } else {
+        ESP_LOGI(TAG, "  Bus 0: Found %d device(s)", devices_found);
+    }
+
+    // Scan LCD bus
+    ESP_LOGI(TAG, "Scanning I2C Bus 1 (LCD)...");
+    devices_found = 0;
+
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        if (i2c_master_probe(i2c_bus1, addr, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "  Bus 1: Found device at 0x%02X", addr);
+            devices_found++;
+        }
+    }
+
+    if (devices_found == 0) {
+        ESP_LOGW(TAG, "  Bus 1: No I2C devices found - LCD not connected?");
+    } else {
+        ESP_LOGI(TAG, "  Bus 1: Found %d device(s)", devices_found);
+    }
+}
+
+static esp_err_t i2c_write_byte(i2c_master_dev_handle_t dev, uint8_t reg_addr, uint8_t data)
+{
+    uint8_t buf[2] = {reg_addr, data};
+    return i2c_master_transmit(dev, buf, 2, 1000);
+}
+
+static esp_err_t i2c_read_bytes(i2c_master_dev_handle_t dev, uint8_t reg_addr, uint8_t *data, size_t len)
+{
+    return i2c_master_transmit_receive(dev, &reg_addr, 1, data, len, 1000);
+}
+
+/* ==================== LCD1602A I2C Functions ==================== */
+
+// LCD Commands
+#define LCD_CMD_CLEAR           0x01
+#define LCD_CMD_HOME            0x02
+#define LCD_CMD_ENTRY_MODE      0x04
+#define LCD_CMD_DISPLAY_CTRL    0x08
+#define LCD_CMD_CURSOR_SHIFT    0x10
+#define LCD_CMD_FUNCTION_SET    0x20
+#define LCD_CMD_SET_CGRAM_ADDR  0x40
+#define LCD_CMD_SET_DDRAM_ADDR  0x80
+
+// Flags for display entry mode
+#define LCD_ENTRY_RIGHT         0x00
+#define LCD_ENTRY_LEFT          0x02
+#define LCD_ENTRY_SHIFT_INC     0x01
+#define LCD_ENTRY_SHIFT_DEC     0x00
+
+// Flags for display on/off control
+#define LCD_DISPLAY_ON          0x04
+#define LCD_DISPLAY_OFF         0x00
+#define LCD_CURSOR_ON           0x02
+#define LCD_CURSOR_OFF          0x00
+#define LCD_BLINK_ON            0x01
+#define LCD_BLINK_OFF           0x00
+
+// Flags for function set
+#define LCD_8BIT_MODE           0x10
+#define LCD_4BIT_MODE           0x00
+#define LCD_2LINE               0x08
+#define LCD_1LINE               0x00
+#define LCD_5x10_DOTS           0x04
+#define LCD_5x8_DOTS            0x00
+
+// Backlight control
+#define LCD_BACKLIGHT           0x08
+#define LCD_NO_BACKLIGHT        0x00
+
+#define LCD_EN                  0x04  // Enable bit
+#define LCD_RW                  0x02  // Read/Write bit
+#define LCD_RS                  0x01  // Register select bit
+
+static uint8_t lcd_backlight = LCD_BACKLIGHT;
+static uint8_t lcd_actual_addr = 0;
+static bool lcd_initialized = false;
+static char lcd_last_line[2][17] = {{0}, {0}}; // Last content for resync recovery
+
+static esp_err_t lcd_i2c_write_byte(uint8_t data)
+{
+    if (i2c_dev_lcd == NULL) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t ret = ESP_FAIL;
+    for (int retry = 0; retry < 3 && ret != ESP_OK; retry++) {
+        ret = i2c_master_transmit(i2c_dev_lcd, &data, 1, 100);
+        if (ret != ESP_OK) vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ret;
+}
+
+static void lcd_pulse_enable(uint8_t data)
+{
+    lcd_i2c_write_byte(data | LCD_EN);
+    esp_rom_delay_us(1);  // Enable pulse >450ns
+    lcd_i2c_write_byte(data);
+    esp_rom_delay_us(50); // Command settle time >37us
+}
+
+static esp_err_t lcd_write_nibble(uint8_t nibble, bool is_data)
+{
+    uint8_t data = nibble | lcd_backlight;
+    if (is_data) {
+        data |= LCD_RS;
+    }
+    
+    lcd_pulse_enable(data);
+    return ESP_OK;
+}
+
+static esp_err_t lcd_write_byte(uint8_t byte, bool is_data)
+{
+    esp_err_t ret;
+    
+    // Send high nibble
+    ret = lcd_write_nibble(byte & 0xF0, is_data);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD write high nibble failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Small delay between nibbles
+    esp_rom_delay_us(10);
+    
+    // Send low nibble
+    ret = lcd_write_nibble((byte << 4) & 0xF0, is_data);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD write low nibble failed: %s", esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
+static esp_err_t lcd_send_cmd(uint8_t cmd)
+{
+    return lcd_write_byte(cmd, false);
+}
+
+static esp_err_t lcd_send_data(uint8_t data)
+{
+    return lcd_write_byte(data, true);
+}
+
+static esp_err_t lcd_init(void)
+{
+    esp_err_t ret;
+    uint8_t addresses[] = {0x27, 0x3F};
+    bool found = false;
+    
+    // Try both common I2C LCD addresses
+    for (int i = 0; i < 2; i++) {
+        if (i2c_master_probe(i2c_bus1, addresses[i], 50) == ESP_OK) {
+            i2c_device_config_t lcd_dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = addresses[i],
+                .scl_speed_hz = LCD_I2C_FREQ_HZ,
+            };
+            ret = i2c_master_bus_add_device(i2c_bus1, &lcd_dev_cfg, &i2c_dev_lcd);
+            if (ret == ESP_OK) {
+                lcd_actual_addr = addresses[i];
+                found = true;
+                ESP_LOGI(TAG, "LCD1602A found at address 0x%02X", addresses[i]);
+            }
+            break;
+        }
+    }
+    
+    if (!found) {
+        ESP_LOGW(TAG, "LCD1602A not found at 0x27 or 0x3F");
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    ESP_LOGI(TAG, "Initializing LCD1602A...");
+    vTaskDelay(pdMS_TO_TICKS(100));  // Wait for LCD to power up
+    
+    // Initialize in 4-bit mode following HD44780 datasheet
+    // Step 1: Wait for power-on, then send 0x03 (Function Set 8-bit) three times
+    lcd_write_nibble(0x30, false);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    
+    lcd_write_nibble(0x30, false);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    
+    lcd_write_nibble(0x30, false);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    // Step 2: Switch to 4-bit mode
+    lcd_write_nibble(0x20, false);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    // Step 3: Now in 4-bit mode, configure the display
+    lcd_send_cmd(LCD_CMD_FUNCTION_SET | LCD_4BIT_MODE | LCD_2LINE | LCD_5x8_DOTS);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_OFF);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    lcd_send_cmd(LCD_CMD_CLEAR);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Clear needs longer delay
+    
+    lcd_send_cmd(LCD_CMD_ENTRY_MODE | LCD_ENTRY_LEFT | LCD_ENTRY_SHIFT_DEC);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_ON | LCD_CURSOR_OFF | LCD_BLINK_OFF);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    lcd_initialized = true;
+    ESP_LOGI(TAG, "LCD1602A initialized successfully");
+    return ESP_OK;
+}
+
+static esp_err_t lcd_clear(void)
+{
+    if (!lcd_initialized) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = lcd_send_cmd(LCD_CMD_CLEAR);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Clear command needs longer delay
+    return ret;
+}
+
+static esp_err_t lcd_set_cursor(uint8_t col, uint8_t row)
+{
+    if (!lcd_initialized) return ESP_ERR_INVALID_STATE;
+    uint8_t row_offsets[] = {0x00, 0x40};
+    if (row > 1) row = 1;
+    if (col > 15) col = 15;
+    return lcd_send_cmd(LCD_CMD_SET_DDRAM_ADDR | (col + row_offsets[row]));
+}
+
+static esp_err_t lcd_print(const char *str)
+{
+    if (!lcd_initialized) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = ESP_OK;
+    while (*str && ret == ESP_OK) {
+        ret = lcd_send_data((uint8_t)*str);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "LCD print failed at char '%c': %s", *str, esp_err_to_name(ret));
+            break;
+        }
+        str++;
+    }
+    return ret;
+}
+
+// Re-syncs HD44780 nibble alignment without clearing the display.
+// Called periodically to silently fix any corruption.
+static void lcd_resync(void)
+{
+    if (!lcd_initialized) return;
+    
+    // Re-run the 4-bit init sequence — this puts the HD44780 back into
+    // a known state regardless of how many orphaned nibbles it received.
+    lcd_write_nibble(0x30, false); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_write_nibble(0x30, false); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_write_nibble(0x30, false); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_write_nibble(0x20, false); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_send_cmd(LCD_CMD_FUNCTION_SET | LCD_4BIT_MODE | LCD_2LINE | LCD_5x8_DOTS);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_ON | LCD_CURSOR_OFF | LCD_BLINK_OFF);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    // Immediately redraw last known content so the resync is invisible
+    if (lcd_last_line[0][0]) {
+        lcd_set_cursor(0, 0);
+        lcd_print(lcd_last_line[0]);
+    }
+    if (lcd_last_line[1][0]) {
+        lcd_set_cursor(0, 1);
+        lcd_print(lcd_last_line[1]);
+    }
+}
+
+static void lcd_printf(uint8_t col, uint8_t row, const char *format, ...)
+{
+    if (!lcd_initialized) return;
+    
+    char buffer[17];  // 16 chars + null terminator
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    // Pad with spaces to always write exactly 16 characters (overwrites old text)
+    int len = strlen(buffer);
+    for (int i = len; i < 16; i++) {
+        buffer[i] = ' ';
+    }
+    buffer[16] = '\0';
+    
+    // Save for resync recovery
+    if (row < 2) memcpy(lcd_last_line[row], buffer, 17);
+    
+    esp_err_t ret = lcd_set_cursor(col, row);
+    if (ret == ESP_OK) {
+        lcd_print(buffer);
+    } else {
+        ESP_LOGW(TAG, "LCD set cursor failed: %s", esp_err_to_name(ret));
+    }
+}
+
+/* ==================== Button Handler ==================== */
+
+static void IRAM_ATTR button_isr_handler(void* arg)
+{
+    uint32_t now = xTaskGetTickCountFromISR();
+    // Debounce: ignore presses within 300ms
+    if (now - last_button_time > pdMS_TO_TICKS(300)) {
+        last_button_time = now;
+        display_mode = (display_mode + 1) % 2; // Toggle between 0 and 1
+    }
+}
+
+static esp_err_t button_init(void)
+{
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,  // Trigger on button press (falling edge)
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
     };
     
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) return err;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL));
     
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    ESP_LOGI(TAG, "Button initialized on GPIO %d", BUTTON_GPIO);
+    return ESP_OK;
 }
 
-static esp_err_t i2c_write_byte(uint8_t device_addr, uint8_t reg_addr, uint8_t data)
-{
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (device_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg_addr, true);
-    i2c_master_write_byte(cmd, data, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
-    i2c_cmd_link_delete(cmd);
-    return ret;
-}
+/* ==================== Helper Functions ==================== */
 
-static esp_err_t i2c_read_bytes(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, size_t len)
+static void get_ip_string(char *ip_str, size_t max_len)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (device_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg_addr, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (device_addr << 1) | I2C_MASTER_READ, true);
-    if (len > 1) {
-        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, max_len, "" IPSTR "", IP2STR(&ip_info.ip));
+            return;
+        }
     }
-    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    snprintf(ip_str, max_len, "No IP");
+}
+
+static void get_datetime_string(char *date_str, char *time_str, size_t max_len)
+{
+    struct tm timeinfo;
+    time_t now;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    // Format: "Mar 12, 2026" and "14:35:22"
+    strftime(date_str, max_len, "%b %d, %Y", &timeinfo);
+    strftime(time_str, max_len, "%H:%M:%S", &timeinfo);
 }
 
 /* ==================== DS3231 RTC Functions ==================== */
@@ -235,7 +613,7 @@ static uint8_t dec_to_bcd(uint8_t val)
 static esp_err_t rtc_get_time(struct tm *timeinfo)
 {
     uint8_t data[7];
-    esp_err_t ret = i2c_read_bytes(RTC_I2C_ADDR, 0x00, data, 7);
+    esp_err_t ret = i2c_read_bytes(i2c_dev_rtc, 0x00, data, 7);
     if (ret != ESP_OK) return ret;
     
     timeinfo->tm_sec = bcd_to_dec(data[0] & 0x7F);
@@ -251,17 +629,17 @@ static esp_err_t rtc_get_time(struct tm *timeinfo)
 static esp_err_t rtc_set_time(struct tm *timeinfo)
 {
     esp_err_t ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x00, dec_to_bcd(timeinfo->tm_sec));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x00, dec_to_bcd(timeinfo->tm_sec));
     if (ret != ESP_OK) return ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x01, dec_to_bcd(timeinfo->tm_min));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x01, dec_to_bcd(timeinfo->tm_min));
     if (ret != ESP_OK) return ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x02, dec_to_bcd(timeinfo->tm_hour));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x02, dec_to_bcd(timeinfo->tm_hour));
     if (ret != ESP_OK) return ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x04, dec_to_bcd(timeinfo->tm_mday));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x04, dec_to_bcd(timeinfo->tm_mday));
     if (ret != ESP_OK) return ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x05, dec_to_bcd(timeinfo->tm_mon + 1));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x05, dec_to_bcd(timeinfo->tm_mon + 1));
     if (ret != ESP_OK) return ret;
-    ret = i2c_write_byte(RTC_I2C_ADDR, 0x06, dec_to_bcd(timeinfo->tm_year - 100));
+    ret = i2c_write_byte(i2c_dev_rtc, 0x06, dec_to_bcd(timeinfo->tm_year - 100));
     
     return ret;
 }
@@ -276,33 +654,124 @@ static float gyro_offset_x = 0.0f;
 static float gyro_offset_y = 0.0f;
 static float gyro_offset_z = 0.0f;
 static bool mpu6050_calibrated = false;
+static uint8_t mpu6050_actual_addr = 0;  // Store detected address
 
 static esp_err_t mpu6050_init(void)
 {
     esp_err_t ret;
+    uint8_t addresses[] = {0x69, 0x68};  // Try 0x69 first, then 0x68
+    bool found = false;
     
-    // Wake up MPU6050
-    ret = i2c_write_byte(MPU6050_I2C_ADDR, 0x6B, 0x00);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MPU6050 wake up failed");
-        return ret;
+    // Try both possible I2C addresses
+    for (int i = 0; i < 2; i++) {
+        uint8_t test_addr = addresses[i];
+
+        ESP_LOGI(TAG, "Trying MPU6050 at address 0x%02X...", test_addr);
+
+        // Check if any device ACKs at this address
+        if (i2c_master_probe(i2c_bus0, test_addr, 50) != ESP_OK) {
+            ESP_LOGW(TAG, "No device found at 0x%02X", test_addr);
+            continue;
+        }
+
+        // Add a temporary device handle for detection
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = test_addr,
+            .scl_speed_hz = I2C_FREQ_HZ,
+        };
+        i2c_master_dev_handle_t temp_dev = NULL;
+        ret = i2c_master_bus_add_device(i2c_bus0, &dev_cfg, &temp_dev);
+        if (ret != ESP_OK) continue;
+
+        // Try to wake up the device
+        ret = i2c_write_byte(temp_dev, 0x6B, 0x00);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to wake MPU6050 at 0x%02X (error: %d)", test_addr, ret);
+            i2c_master_bus_rm_device(temp_dev);
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));  // Wait for sensor to wake up
+
+        // Try to read WHO_AM_I register (0x75)
+        uint8_t who_am_i = 0;
+        ret = i2c_read_bytes(temp_dev, 0x75, &who_am_i, 1);
+
+        ESP_LOGI(TAG, "WHO_AM_I read: ret=%d, value=0x%02X", ret, who_am_i);
+
+        // MPU6050 WHO_AM_I should return 0x68, but accept compatible sensors:
+        // 0x68 = MPU6050
+        // 0x69, 0x72, 0x98 = MPU6050 clones
+        // 0x70 = MPU6500 / MPU9250
+        // 0x71 = MPU6555
+        // 0x73 = MPU9255
+        if (ret == ESP_OK && (who_am_i == 0x68 || who_am_i == 0x69 || who_am_i == 0x70 ||
+                              who_am_i == 0x71 || who_am_i == 0x72 || who_am_i == 0x73 || who_am_i == 0x98)) {
+            // Found compatible MPU sensor — keep the device handle
+            mpu6050_actual_addr = test_addr;
+            i2c_dev_imu = temp_dev;
+            found = true;
+
+            // Identify the sensor type
+            const char* sensor_name;
+            if (who_am_i == 0x68) sensor_name = "MPU6050";
+            else if (who_am_i == 0x70) sensor_name = "MPU6500/MPU9250";
+            else if (who_am_i == 0x71) sensor_name = "MPU6555";
+            else if (who_am_i == 0x73) sensor_name = "MPU9255";
+            else sensor_name = "MPU6050-compatible";
+
+            ESP_LOGI(TAG, "%s found at address 0x%02X (WHO_AM_I=0x%02X)", sensor_name, test_addr, who_am_i);
+
+            if (test_addr == 0x68) {
+                ESP_LOGW(TAG, "IMU using same address as RTC (0x68)!");
+                ESP_LOGW(TAG, "Consider connecting AD0 pin to 3.3V to use address 0x69");
+            }
+            break;
+        } else {
+            if (ret == ESP_OK) {
+                ESP_LOGW(TAG, "Device at 0x%02X responded but WHO_AM_I is 0x%02X (unknown sensor)", test_addr, who_am_i);
+            }
+            i2c_master_bus_rm_device(temp_dev);
+        }
+    }
+    
+    if (!found) {
+        ESP_LOGE(TAG, "MPU6050/6500 compatible IMU not found at 0x68 or 0x69");
+        ESP_LOGE(TAG, "Check wiring: SDA=%d, SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
+        ESP_LOGE(TAG, "Note: Device at 0x57 is typically DS3231 EEPROM");
+        return ESP_ERR_NOT_FOUND;
     }
     
     // Set accelerometer range to ±2g
-    ret = i2c_write_byte(MPU6050_I2C_ADDR, 0x1C, 0x00);
-    if (ret != ESP_OK) return ret;
+    ret = i2c_write_byte(i2c_dev_imu, 0x1C, 0x00);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure accelerometer");
+        return ret;
+    }
     
     // Set gyroscope range to ±250°/s
-    ret = i2c_write_byte(MPU6050_I2C_ADDR, 0x1B, 0x00);
+    ret = i2c_write_byte(i2c_dev_imu, 0x1B, 0x00);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure gyroscope");
+        return ret;
+    }
     
-    ESP_LOGI(TAG, "MPU6050 initialized");
+    // Set sample rate (1kHz / (1 + SMPLRT_DIV))
+    ret = i2c_write_byte(i2c_dev_imu, 0x19, 0x07);  // 125 Hz
+    if (ret != ESP_OK) return ret;
+    
+    // Configure digital low pass filter
+    ret = i2c_write_byte(i2c_dev_imu, 0x1A, 0x03);  // ~44 Hz cutoff
+    
+    ESP_LOGI(TAG, "MPU6050 initialized successfully at 0x%02X", mpu6050_actual_addr);
     return ret;
 }
 
 static esp_err_t mpu6050_read_data(imu_data_t *imu_data)
 {
     uint8_t data[14];
-    esp_err_t ret = i2c_read_bytes(MPU6050_I2C_ADDR, 0x3B, data, 14);
+    esp_err_t ret = i2c_read_bytes(i2c_dev_imu, 0x3B, data, 14);
     if (ret != ESP_OK) return ret;
     
     int16_t accel_x_raw = (data[0] << 8) | data[1];
@@ -336,7 +805,7 @@ static esp_err_t mpu6050_calibrate(void)
     // Collect samples
     for (int i = 0; i < samples; i++) {
         uint8_t data[14];
-        esp_err_t ret = i2c_read_bytes(MPU6050_I2C_ADDR, 0x3B, data, 14);
+        esp_err_t ret = i2c_read_bytes(i2c_dev_imu, 0x3B, data, 14);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Calibration failed at sample %d", i);
             return ret;
@@ -804,6 +1273,8 @@ static void gps_logging_task(void *pvParameters)
     
     gps_data_t gps_data = {0};
     imu_data_t imu_data = {0};
+    uint8_t last_display_mode = 0;
+    uint32_t lcd_resync_counter = 0;
     
     ESP_LOGI(TAG, "GPS logging task started");
     
@@ -864,12 +1335,68 @@ static void gps_logging_task(void *pvParameters)
                          gps_data.altitude, gps_data.speed,
                          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
             }
+            
+            // Update LCD with GPS data (now fast with dedicated bus!)
+            if (lcd_initialized) {
+                // Clear display if mode changed
+                if (display_mode != last_display_mode) {
+                    lcd_clear();
+                    last_display_mode = display_mode;
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                
+                if (display_mode == 0) {
+                    // GPS/IMU mode
+                    lcd_printf(0, 0, "%.1fkm %.1fm", gps_data.speed, gps_data.altitude);
+                    lcd_printf(0, 1, "%.2f,%.2f", gps_data.latitude, gps_data.longitude);
+                } else {
+                    // Time/IP mode
+                    char date_str[17], time_str[17], ip_str[17];
+                    get_datetime_string(date_str, time_str, sizeof(date_str));
+                    get_ip_string(ip_str, sizeof(ip_str));
+                    lcd_printf(0, 0, "%s", time_str);
+                    lcd_printf(0, 1, "%s", ip_str);
+                }
+            }
         } else {
             ESP_LOGW(TAG, "Waiting for GPS fix... (accel: %.3f, %.3f, %.3f g)",
                      imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+            
+            // Update LCD showing "No GPS" and IMU data (now fast with dedicated bus!)
+            if (lcd_initialized) {
+                // Clear display if mode changed
+                if (display_mode != last_display_mode) {
+                    lcd_clear();
+                    last_display_mode = display_mode;
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                
+                if (display_mode == 0) {
+                    // GPS/IMU mode
+                    lcd_printf(0, 0, "No GPS Fix");
+                    lcd_printf(0, 1, "A:%.2f,%.2f,%.2f", 
+                              imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                } else {
+                    // Time/IP mode
+                    char date_str[17], time_str[17], ip_str[17];
+                    get_datetime_string(date_str, time_str, sizeof(date_str));
+                    get_ip_string(ip_str, sizeof(ip_str));
+                    lcd_printf(0, 0, "%s", time_str);
+                    lcd_printf(0, 1, "%s", ip_str);
+                }
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(1000)); // Log every second
+        
+        // Resync LCD every 5 seconds to silently fix any nibble misalignment
+        if (lcd_initialized) {
+            lcd_resync_counter++;
+            if (lcd_resync_counter >= 5) {
+                lcd_resync_counter = 0;
+                lcd_resync();
+            }
+        }
     }
     
     free(data);
@@ -889,9 +1416,26 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     
-    // Initialize I2C
+    // Initialize I2C (both buses)
     ESP_ERROR_CHECK(i2c_master_init());
-    ESP_LOGI(TAG, "I2C initialized");
+    ESP_LOGI(TAG, "I2C initialized on two buses");
+    ESP_LOGI(TAG, "  Bus 0 (IMU/RTC): SDA=GPIO%d, SCL=GPIO%d", I2C_SDA_PIN, I2C_SCL_PIN);
+    ESP_LOGI(TAG, "  Bus 1 (LCD): SDA=GPIO%d, SCL=GPIO%d", LCD_I2C_SDA_PIN, LCD_I2C_SCL_PIN);
+    
+    // Scan I2C bus to detect devices
+    i2c_scan();
+    
+    // Initialize LCD1602A
+    if (lcd_init() == ESP_OK) {
+        lcd_clear();
+        lcd_printf(0, 0, "GPS Logger");
+        lcd_printf(0, 1, "Initializing...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    
+    // Initialize button
+    button_init();
+    ESP_LOGI(TAG, "Press BOOT button to toggle LCD display mode");
     
     // Initialize MPU6050
     if (mpu6050_init() != ESP_OK) {
