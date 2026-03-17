@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -23,6 +24,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -36,10 +38,14 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "rom/ets_sys.h"
+#include <math.h>
+#include <inttypes.h>
 
-// WiFi Configuration - EDIT THESE
-#define WIFI_SSID "Zero Gravitas"
-#define WIFI_PASSWORD "ILoveLydia!"
+#include "esp_timer.h"
+#include "sync_config.h"
+#include "sd_storage.h"
+#include "wifi_upload.h"
+#include "espnow_sync.h"
 
 // Timezone Configuration - EDIT THIS
 // Common timezones:
@@ -76,6 +82,10 @@
 #define SD_D0_PIN           2
 
 #define BUTTON_GPIO         0    // BOOT button on most ESP32 boards
+
+// LCD Feature Flags
+#define LCD_ENABLED         1    // Set to 0 to disable LCD (for builds without LCD hardware)
+#define LCD_TIMEOUT_SEC     30   // Seconds of inactivity before LCD auto-off (0 = always on)
 
 // SD Card Mount Point
 #define MOUNT_POINT "/sdcard"
@@ -118,6 +128,11 @@ typedef struct {
     float gyro_y;
     float gyro_z;
 } imu_data_t;
+
+// Shared motion state - written by gps_logging_task, read by sync_state_machine_task
+static gps_data_t current_gps = {0};
+static imu_data_t current_imu = {0};
+static char g_own_mac_str[5] = {0}; // "AABB\0" – last 4 hex digits of WiFi MAC
 
 /* ==================== Timezone Detection from GPS ==================== */
 
@@ -320,6 +335,9 @@ static uint8_t lcd_backlight = LCD_BACKLIGHT;
 static uint8_t lcd_actual_addr = 0;
 static bool lcd_initialized = false;
 static char lcd_last_line[2][17] = {{0}, {0}}; // Last content for resync recovery
+static volatile bool lcd_display_on = false;
+static volatile uint32_t lcd_last_activity_time = 0;
+static volatile bool lcd_wake_requested = false;
 
 static esp_err_t lcd_i2c_write_byte(uint8_t data)
 {
@@ -448,6 +466,7 @@ static esp_err_t lcd_init(void)
     lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_ON | LCD_CURSOR_OFF | LCD_BLINK_OFF);
     vTaskDelay(pdMS_TO_TICKS(1));
     
+    lcd_display_on = true;
     lcd_initialized = true;
     ESP_LOGI(TAG, "LCD1602A initialized successfully");
     return ESP_OK;
@@ -513,6 +532,20 @@ static void lcd_resync(void)
     }
 }
 
+static void lcd_set_power(bool on)
+{
+    if (!lcd_initialized) return;
+    lcd_backlight = on ? LCD_BACKLIGHT : LCD_NO_BACKLIGHT;
+    if (on) {
+        lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_ON | LCD_CURSOR_OFF | LCD_BLINK_OFF);
+        lcd_display_on = true;
+    } else {
+        lcd_send_cmd(LCD_CMD_DISPLAY_CTRL | LCD_DISPLAY_OFF);
+        lcd_i2c_write_byte(LCD_NO_BACKLIGHT);  // Also kill backlight
+        lcd_display_on = false;
+    }
+}
+
 static void lcd_printf(uint8_t col, uint8_t row, const char *format, ...)
 {
     if (!lcd_initialized) return;
@@ -549,7 +582,12 @@ static void IRAM_ATTR button_isr_handler(void* arg)
     // Debounce: ignore presses within 300ms
     if (now - last_button_time > pdMS_TO_TICKS(300)) {
         last_button_time = now;
-        display_mode = (display_mode + 1) % 2; // Toggle between 0 and 1
+        lcd_last_activity_time = now;
+        if (!lcd_display_on) {
+            lcd_wake_requested = true;  // Wake LCD; don't toggle mode on first press
+        } else {
+            display_mode = (display_mode + 1) % 2;
+        }
     }
 }
 
@@ -700,26 +738,22 @@ static esp_err_t mpu6050_init(void)
 
         ESP_LOGI(TAG, "WHO_AM_I read: ret=%d, value=0x%02X", ret, who_am_i);
 
-        // MPU6050 WHO_AM_I should return 0x68, but accept compatible sensors:
-        // 0x68 = MPU6050
-        // 0x69, 0x72, 0x98 = MPU6050 clones
-        // 0x70 = MPU6500 / MPU9250
-        // 0x71 = MPU6555
-        // 0x73 = MPU9255
-        if (ret == ESP_OK && (who_am_i == 0x68 || who_am_i == 0x69 || who_am_i == 0x70 ||
-                              who_am_i == 0x71 || who_am_i == 0x72 || who_am_i == 0x73 || who_am_i == 0x98)) {
+        // Accept device if WHO_AM_I read succeeded — any value is treated as a compatible
+        // MPU6050-family sensor. Known values:
+        //   0x68 = MPU6050, 0x70 = MPU6500/MPU9250, 0x71 = MPU6555,
+        //   0x72/0x73/0x98/0x19/0x69 = various clones
+        if (ret == ESP_OK) {
             // Found compatible MPU sensor — keep the device handle
             mpu6050_actual_addr = test_addr;
             i2c_dev_imu = temp_dev;
             found = true;
 
-            // Identify the sensor type
             const char* sensor_name;
-            if (who_am_i == 0x68) sensor_name = "MPU6050";
+            if (who_am_i == 0x68)      sensor_name = "MPU6050";
             else if (who_am_i == 0x70) sensor_name = "MPU6500/MPU9250";
             else if (who_am_i == 0x71) sensor_name = "MPU6555";
             else if (who_am_i == 0x73) sensor_name = "MPU9255";
-            else sensor_name = "MPU6050-compatible";
+            else                        sensor_name = "MPU6050-compatible";
 
             ESP_LOGI(TAG, "%s found at address 0x%02X (WHO_AM_I=0x%02X)", sensor_name, test_addr, who_am_i);
 
@@ -729,9 +763,7 @@ static esp_err_t mpu6050_init(void)
             }
             break;
         } else {
-            if (ret == ESP_OK) {
-                ESP_LOGW(TAG, "Device at 0x%02X responded but WHO_AM_I is 0x%02X (unknown sensor)", test_addr, who_am_i);
-            }
+            ESP_LOGW(TAG, "Device at 0x%02X ACKed probe but WHO_AM_I read failed (err %d)", test_addr, ret);
             i2c_master_bus_rm_device(temp_dev);
         }
     }
@@ -770,6 +802,7 @@ static esp_err_t mpu6050_init(void)
 
 static esp_err_t mpu6050_read_data(imu_data_t *imu_data)
 {
+    if (i2c_dev_imu == NULL) return ESP_ERR_INVALID_STATE;
     uint8_t data[14];
     esp_err_t ret = i2c_read_bytes(i2c_dev_imu, 0x3B, data, 14);
     if (ret != ESP_OK) return ret;
@@ -952,7 +985,7 @@ static esp_err_t sd_card_init(void)
     
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 5,
+        .max_files = 10,
         .allocation_unit_size = 16 * 1024
     };
     
@@ -982,8 +1015,11 @@ static esp_err_t sd_card_init(void)
     // Create GPS directory if it doesn't exist
     struct stat st;
     if (stat(GPS_DIR, &st) != 0) {
-        mkdir(GPS_DIR, 0775);
-        ESP_LOGI(TAG, "Created directory: %s", GPS_DIR);
+        if (mkdir(GPS_DIR, 0775) != 0) {
+            ESP_LOGE(TAG, "Failed to create directory: %s (errno %d)", GPS_DIR, errno);
+        } else {
+            ESP_LOGI(TAG, "Created directory: %s", GPS_DIR);
+        }
     }
     
     return ESP_OK;
@@ -1006,12 +1042,22 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
              timeinfo.tm_mon + 1,
              timeinfo.tm_mday);
     
+    // Ensure GPS directory exists (may have been lost if SD card was re-mounted)
+    struct stat st;
+    if (stat(GPS_DIR, &st) != 0) {
+        if (mkdir(GPS_DIR, 0775) != 0) {
+            ESP_LOGE(TAG, "Failed to create directory: %s (errno %d)", GPS_DIR, errno);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Re-created directory: %s", GPS_DIR);
+    }
+
     // Check if file exists to determine if we need to write header
     bool file_exists = (access(filename, F_OK) == 0);
     
     FILE *f = fopen(filename, "a");
     if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s", filename);
+        ESP_LOGE(TAG, "Failed to open file for writing: %s (errno %d)", filename, errno);
         return ESP_FAIL;
     }
     
@@ -1037,6 +1083,20 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
             imu_data->accel_z);
     
     fclose(f);
+
+    // Also append a sync-format record (Unix epoch, lat, lon, accel, MAC) to
+    // sync_data.csv so the ESP-NOW subsystem can exchange own GPS data with peers.
+    if (g_own_mac_str[0] != '\0') {
+        char sync_rec[128];
+        snprintf(sync_rec, sizeof(sync_rec),
+                 "%" PRId64 ",%.6f,%.6f,%.4f,%.4f,%.4f,%s\n",
+                 (int64_t)time(NULL),
+                 gps_data->latitude, gps_data->longitude,
+                 imu_data->accel_x, imu_data->accel_y, imu_data->accel_z,
+                 g_own_mac_str);
+        sd_append_record(sync_rec);
+    }
+
     return ESP_OK;
 }
 
@@ -1306,10 +1366,31 @@ static void gps_logging_task(void *pvParameters)
         
         // Read IMU data
         esp_err_t imu_ret = mpu6050_read_data(&imu_data);
-        if (imu_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to read IMU data: %s", esp_err_to_name(imu_ret));
+        if (imu_ret != ESP_OK && imu_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGD(TAG, "Failed to read IMU data: %s", esp_err_to_name(imu_ret));
         }
-        
+
+        // Update shared motion state used by the ESP-NOW sync task
+        current_gps = gps_data;
+        current_imu = imu_data;
+
+        // Handle LCD wake request (button pressed while LCD was off)
+        if (lcd_initialized && lcd_wake_requested) {
+            lcd_wake_requested = false;
+            lcd_set_power(true);
+            last_display_mode = 0xFF;  // Force full redraw on next update
+        }
+
+        // Auto-off: power down LCD after LCD_TIMEOUT_SEC seconds of inactivity
+#if LCD_TIMEOUT_SEC > 0
+        if (lcd_initialized && lcd_display_on) {
+            uint32_t now_ticks = xTaskGetTickCount();
+            if (now_ticks - lcd_last_activity_time > pdMS_TO_TICKS((uint32_t)LCD_TIMEOUT_SEC * 1000UL)) {
+                lcd_set_power(false);
+            }
+        }
+#endif
+
         // Log data if GPS is valid
         if (gps_data.valid) {
             // Set timezone from GPS on first valid fix
@@ -1337,7 +1418,7 @@ static void gps_logging_task(void *pvParameters)
             }
             
             // Update LCD with GPS data (now fast with dedicated bus!)
-            if (lcd_initialized) {
+            if (lcd_initialized && lcd_display_on) {
                 // Clear display if mode changed
                 if (display_mode != last_display_mode) {
                     lcd_clear();
@@ -1363,7 +1444,7 @@ static void gps_logging_task(void *pvParameters)
                      imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
             
             // Update LCD showing "No GPS" and IMU data (now fast with dedicated bus!)
-            if (lcd_initialized) {
+            if (lcd_initialized && lcd_display_on) {
                 // Clear display if mode changed
                 if (display_mode != last_display_mode) {
                     lcd_clear();
@@ -1390,7 +1471,7 @@ static void gps_logging_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000)); // Log every second
         
         // Resync LCD every 5 seconds to silently fix any nibble misalignment
-        if (lcd_initialized) {
+        if (lcd_initialized && lcd_display_on) {
             lcd_resync_counter++;
             if (lcd_resync_counter >= 5) {
                 lcd_resync_counter = 0;
@@ -1400,6 +1481,148 @@ static void gps_logging_task(void *pvParameters)
     }
     
     free(data);
+}
+
+/* ==================== Motion Detection ==================== */
+
+// Thresholds for deciding the device is stationary
+#define GPS_STATIC_SPEED_KMH  2.0f    // km/h – below this speed = stationary
+#define IMU_ACCEL_DEVIATION   0.15f   // g deviation from 1g = stationary
+#define IMU_GYRO_STATIC_DPS   5.0f    // deg/s below this = stationary
+#define STATIC_REQUIRED_MS    5000    // ms of continuous stillness before sync
+
+// Returns true when the device is confirmed (or assumed) to be stationary.
+// Logic:
+//   - If BOTH sensors are unavailable, assume static (safe fallback — better
+//     to sync unnecessarily than never sync when hardware is missing).
+//   - If only GPS is unavailable, rely solely on IMU.
+//   - If only IMU is unavailable, rely solely on GPS.
+//   - If both are available, both must agree the device is still.
+static bool motion_is_static(void)
+{
+    bool gps_available = current_gps.valid;          // valid fix received at least once
+    bool imu_available = (mpu6050_actual_addr != 0); // IMU detected during init
+
+    // Neither sensor working — assume static so sync can still happen
+    if (!gps_available && !imu_available) {
+        return true;
+    }
+
+    // GPS check: speed below threshold (only used when a valid fix exists)
+    bool gps_static = !gps_available || (current_gps.speed < GPS_STATIC_SPEED_KMH);
+
+    // IMU check: accel magnitude ≈ 1 g (gravity only) and gyro near zero
+    bool imu_static = true;
+    if (imu_available) {
+        float am = sqrtf(current_imu.accel_x * current_imu.accel_x +
+                         current_imu.accel_y * current_imu.accel_y +
+                         current_imu.accel_z * current_imu.accel_z);
+        float gm = sqrtf(current_imu.gyro_x  * current_imu.gyro_x  +
+                         current_imu.gyro_y  * current_imu.gyro_y  +
+                         current_imu.gyro_z  * current_imu.gyro_z);
+        imu_static = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) && (gm < IMU_GYRO_STATIC_DPS);
+    }
+
+    // Only evaluate sensors that are actually available
+    if (gps_available && imu_available) return gps_static && imu_static;
+    if (gps_available)                  return gps_static;
+    return imu_static;
+}
+
+/* ==================== Sync State Machine (Core 0) ==================== */
+/*
+ * Runs on Core 0 so it does not compete with the Core 1 GPS/IMU/LCD task.
+ *
+ * Algorithm:
+ *  1. Wait until motion_is_static() is true (GPS speed + IMU confirm device
+ *     is parked).
+ *  2. While still static (and under SYNC_SEARCH_TIME_MAX iterations):
+ *       a. If WiFi is connected and the upload interval has elapsed, POST
+ *          sync_data.csv and sync_merged.csv to the server.  On success delete
+ *          and recreate the files so the next upload stays small.
+ *       b. Run one ESP-NOW discovery + bidirectional CSV sync round.
+ *          Received peer records are merged into sync_merged.csv.
+ *  3. When the device starts moving (or the iteration limit is reached) reset
+ *     and go back to step 1.
+ *
+ * The WiFi driver is already  initialised and connected by wifi_init_sta() on
+ * the main core; we never call esp_wifi_start/stop here.  ESP-NOW runs on top
+ * of the existing STA driver.
+ */
+
+static void sync_state_machine_task(void *pv)
+{
+    // Wait for the rest of the system to finish booting
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // sd_init() was already called in app_main (will detect the existing mount
+    // and just set up the mutex).  Ensure the sync CSV files exist.
+    sd_ensure_data_file();
+    sd_ensure_merged_file();
+
+    ESP_LOGI(TAG, "Sync state machine started on Core 0");
+
+    while (true) {
+        // ── Wait until the device is confirmed static ─────────────────────────
+        if (!motion_is_static()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Device is static \u2013 entering sync loop");
+
+        int     search_time       = 0;
+        int64_t next_wifi_attempt = 0; // epoch-s; 0 = try on first iteration
+
+        while (motion_is_static() && search_time < SYNC_SEARCH_TIME_MAX) {
+
+            // ── WiFi upload ───────────────────────────────────────────────────
+            int64_t now_s = esp_timer_get_time() / 1000000LL;
+            if (now_s >= next_wifi_attempt) {
+                if (wifi_is_connected()) {
+                    ESP_LOGI(TAG, "[%d] WiFi up \u2013 uploading sync files...", search_time);
+                    if (wifi_upload_all_csv()) {
+                        ESP_LOGI(TAG, "Upload OK \u2013 resetting sync files");
+                        sd_delete_data_file();
+                        sd_ensure_data_file();
+                        sd_delete_merged_file();
+                        sd_ensure_merged_file();
+                        espnow_sync_reset_peer_states();
+                    } else {
+                        ESP_LOGW(TAG, "Upload failed \u2013 will retry");
+                    }
+                } else {
+                    ESP_LOGW(TAG, "[%d] WiFi not connected \u2013 skipping upload",
+                             search_time);
+                }
+                next_wifi_attempt = (esp_timer_get_time() / 1000000LL)
+                                    + SYNC_WIFI_UPLOAD_INTERVAL_S;
+            }
+
+            // ── ESP-NOW peer discovery and CSV sync ───────────────────────────
+            if (!espnow_init()) {
+                ESP_LOGE(TAG, "ESP-NOW init failed \u2013 skipping sync round");
+            } else {
+                ESP_LOGI(TAG, "[%d] Running ESP-NOW sync round...", search_time);
+                int synced = espnow_sync_round();
+                ESP_LOGI(TAG, "[%d] Synced with %d peer(s)", search_time, synced);
+                espnow_deinit();
+            }
+
+            // ── Re-check motion ───────────────────────────────────────────────
+            if (!motion_is_static()) {
+                ESP_LOGI(TAG, "Device started moving \u2013 exiting sync loop");
+                break;
+            }
+
+            search_time++;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        ESP_LOGI(TAG, "Sync window complete (search_time=%d) \u2013 resetting",
+                 search_time);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }
 
 /* ==================== Main Application ==================== */
@@ -1425,13 +1648,16 @@ void app_main(void)
     // Scan I2C bus to detect devices
     i2c_scan();
     
+#if LCD_ENABLED
     // Initialize LCD1602A
     if (lcd_init() == ESP_OK) {
         lcd_clear();
         lcd_printf(0, 0, "GPS Logger");
         lcd_printf(0, 1, "Initializing...");
         vTaskDelay(pdMS_TO_TICKS(1000));
+        lcd_last_activity_time = xTaskGetTickCount();
     }
+#endif
     
     // Initialize button
     button_init();
@@ -1479,13 +1705,39 @@ void app_main(void)
     if (sd_card_init() != ESP_OK) {
         ESP_LOGE(TAG, "SD Card initialization failed - check connections");
     }
+
+    // Attach the sync-storage module to the already-mounted SD card.
+    // sd_init() detects the existing mount and only creates its mutex.
+    if (!sd_init()) {
+        ESP_LOGE(TAG, "Sync SD init failed");
+    }
+
+    // Read own WiFi MAC and format as 4 hex digits for sync CSV records.
+    // Use esp_read_mac() (reads eFuse) so WiFi doesn't need to be started yet.
+    {
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(g_own_mac_str, sizeof(g_own_mac_str), "%02X%02X", mac[4], mac[5]);
+        ESP_LOGI(TAG, "Sync device MAC suffix: %s", g_own_mac_str);
+    }
+
+    // Create the sync CSV files if they do not yet exist.
+    sd_ensure_data_file();
+    sd_ensure_merged_file();
     
     // Initialize GPS UART
     gps_uart_init();
     
     // Initialize WiFi
     wifi_init_sta();
-    
+
+    // Register the WiFi-upload module's event handlers against the already-running
+    // WiFi driver so wifi_is_connected() works correctly from the sync task.
+    wifi_stack_init();
+
+    // Initialize ESP-NOW peer sync (requires WiFi hardware to be up)
+    // espnow_init() is now called per-round inside sync_state_machine_task.
+
     // Sync time via NTP
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     if (bits & WIFI_CONNECTED_BIT) {
@@ -1497,8 +1749,11 @@ void app_main(void)
         server = start_webserver();
     }
     
-    // Start GPS logging task
-    xTaskCreate(gps_logging_task, "gps_logging", 4096, NULL, 5, NULL);
-    
+    // Start GPS logging task on Core 1 (GPS UART, IMU I2C, LCD I2C, RTC I2C)
+    xTaskCreatePinnedToCore(gps_logging_task, "gps_logging", 4096, NULL, 5, NULL, 1);
+
+    // Start ESP-NOW sync state machine on Core 0 (WiFi radio + SD file exchange)
+    xTaskCreatePinnedToCore(sync_state_machine_task, "sync_sm", 8192, NULL, 4, NULL, 0);
+
     ESP_LOGI(TAG, "System initialized. Logging GPS data...");
 }

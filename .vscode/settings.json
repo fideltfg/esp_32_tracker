@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.portWin": "COM6",
+  "idf.portWin": "COM5",
   "idf.toolsPathWin": "C:\\Users\\Leigh\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -18,5 +18,5 @@
   ],
   "idf.flashType": "UART",
   "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
-  "idf.monitorPort": "COM6"
+  "idf.monitorPort": "COM5"
 }
