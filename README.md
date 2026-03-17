@@ -6,9 +6,9 @@ A GPS tracking system with acceleration logging and peer-to-peer data synchronis
 
 This a project to develop a system to record metrics from static and mobile ESP32 devcies within a limited area with sparadic Wi-Fi Covarage.
 
-Concept: Each ESP32 will collect its own data (ATM  GPS and MPU values) and attempt to upload it to a server via Wi-Fi if in range. Some devices a will remain somewaht static while others will be mobile. As the ESP32 devices move close to other ESP32 devcies, using ESPNOW, they begin sharing their collected data. As the mobile device move around, eventualy all data will find it's way within Wi-Fi range and be uploaded to the server. The server will take care of final parsing while anti-duplication methods are run at share time to reduce data transfer times.
+Concept: Each ESP32 will collect its own data (ATM  GPS and MPU values) and attempt to upload it to a server via Wi-Fi if in range. Some devices a will remain somewhat static while others will be mobile. As the ESP32 devices move close to other ESP32 devcies, using ESPNOW, they begin sharing their collected data. As the mobile device move around, eventualy all data will find it's way within Wi-Fi range and be uploaded to the server. The server will take care of final parsing while anti-duplication methods are run at share time to reduce data transfer times.
 
-This project is in active development and in the final stages of prototyping before feild testing.
+This project is in active development and in the final stages of prototyping before feild testing. Expect this code base to change and probably have a few bugs!
 
 ## Features
 
@@ -27,7 +27,7 @@ This project is in active development and in the final stages of prototyping bef
 
 ## Hardware
 
-The hardwear used in this project should e readly availiable online and cost me around $40 per device. As this project is aimed more towards the syncing and uploading of data, you can substitute any sensor set you wish. You will of cause need to update the code to reflect your changes.
+The hardwear used in this project should be readly availiable online and costs around $40 per device. As this project is aimed more towards the syncing and uploading of data, you can substitute any sensor set you wish. You will of cause need to update the code to reflect your changes.
 
 ### ESP32 Module
 I use the Freenove ESP32-WROVER-E dev board for this project. But I think if you are willing to try this you should have no issues modifiying this code base to work with just about any ESP32 model. A SD card is required for the project to record large data sets over days or weeks without syncing or uploading.
