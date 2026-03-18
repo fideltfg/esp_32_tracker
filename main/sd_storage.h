@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /**
  * @file sd_storage.h
@@ -94,3 +95,13 @@ bool sd_delete_merged_file(void);
  * @return Number of bytes read, or -1 on error.
  */
 int  sd_read_all(char *buf, size_t buf_size);
+
+/**
+ * @brief Append one row to CONNECTIONS_LOG_FILE.
+ *        Creates the file with a header row on first call.
+ * @param peer_mac    6-byte MAC address of the peer device.
+ * @param records_rx  Number of records received from the peer this sync.
+ * @param records_tx  Number of records sent to the peer this sync.
+ * @return true on success.
+ */
+bool sd_log_connection(const uint8_t *peer_mac, int records_rx, int records_tx);

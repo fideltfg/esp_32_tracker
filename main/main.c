@@ -47,53 +47,6 @@
 #include "wifi_upload.h"
 #include "espnow_sync.h"
 
-// Timezone Configuration - EDIT THIS
-// Common timezones:
-// "EST5EDT,M3.2.0/2,M11.1.0" - US Eastern
-// "CST6CDT,M3.2.0,M11.1.0" - US Central
-// "MST7MDT,M3.2.0,M11.1.0" - US Mountain
-// "PST8PDT,M3.2.0,M11.1.0" - US Pacific
-// "AEST-10AEDT,M10.1.0,M4.1.0/3" - Australia Eastern
-// "GMT0BST,M3.5.0/1,M10.5.0" - UK
-#define TIMEZONE "MST7MDT,M3.2.0,M11.1.0" // US Mountain
-
-// GPIO Pin Definitions
-#define GPS_UART_NUM        UART_NUM_1
-#define GPS_TX_PIN          23
-#define GPS_RX_PIN          22
-#define GPS_BAUD_RATE       9600
-
-#define I2C_MASTER_NUM      I2C_NUM_0
-#define I2C_SDA_PIN         18
-#define I2C_SCL_PIN         19
-#define I2C_FREQ_HZ         100000
-
-#define LCD_I2C_NUM         I2C_NUM_1
-#define LCD_I2C_SDA_PIN     32
-#define LCD_I2C_SCL_PIN     33
-#define LCD_I2C_FREQ_HZ     100000  // Dedicated bus for LCD
-
-#define RTC_I2C_ADDR        0x68
-#define MPU6050_I2C_ADDR    0x69  // AD0 HIGH, use 0x68 if AD0 LOW
-#define LCD_I2C_ADDR        0x27  // LCD1602A with I2C backpack, try 0x3F if not found
-
-#define SD_CMD_PIN          15
-#define SD_CLK_PIN          14
-#define SD_D0_PIN           2
-
-#define BUTTON_GPIO         0    // BOOT button on most ESP32 boards
-
-// LCD Feature Flags
-#define LCD_ENABLED         1    // Set to 0 to disable LCD (for builds without LCD hardware)
-#define LCD_TIMEOUT_SEC     30   // Seconds of inactivity before LCD auto-off (0 = always on)
-
-// SD Card Mount Point
-#define MOUNT_POINT "/sdcard"
-#define GPS_DIR "/sdcard/gps"
-
-// UART Buffer Size
-#define UART_BUF_SIZE 1024
-
 // WiFi Event Group
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -995,11 +948,11 @@ static esp_err_t sd_card_init(void)
     
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1;
-    slot_config.clk = SD_CLK_PIN;
-    slot_config.cmd = SD_CMD_PIN;
-    slot_config.d0 = SD_D0_PIN;
+    slot_config.clk = SDMMC_CLK_GPIO;
+    slot_config.cmd = SDMMC_CMD_GPIO;
+    slot_config.d0 = SDMMC_D0_GPIO;
     
-    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &card);
     
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
@@ -1063,35 +1016,31 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
     
     // Write header if new file
     if (!file_exists) {
-        fprintf(f, "timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z\n");
+        fprintf(f, "timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z,device_mac\n");
     }
-    
-    // Write data
-    fprintf(f, "%04d-%02d-%02dT%02d:%02d:%02d,%.6f,%.6f,%.1f,%.1f,%.3f,%.3f,%.3f\n",
-            timeinfo.tm_year + 1900,
-            timeinfo.tm_mon + 1,
-            timeinfo.tm_mday,
-            timeinfo.tm_hour,
-            timeinfo.tm_min,
-            timeinfo.tm_sec,
+
+    // Write data — same schema as sync_data.csv so all logs are consistent
+    fprintf(f, "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
+            (int64_t)time(NULL),
             gps_data->latitude,
             gps_data->longitude,
             gps_data->altitude,
             gps_data->speed,
             imu_data->accel_x,
             imu_data->accel_y,
-            imu_data->accel_z);
-    
+            imu_data->accel_z,
+            g_own_mac_str);
+
     fclose(f);
 
-    // Also append a sync-format record (Unix epoch, lat, lon, accel, MAC) to
-    // sync_data.csv so the ESP-NOW subsystem can exchange own GPS data with peers.
+    // Also append to sync_data.csv for ESP-NOW peer exchange and server upload.
     if (g_own_mac_str[0] != '\0') {
-        char sync_rec[128];
+        char sync_rec[160];
         snprintf(sync_rec, sizeof(sync_rec),
-                 "%" PRId64 ",%.6f,%.6f,%.4f,%.4f,%.4f,%s\n",
+                 "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
                  (int64_t)time(NULL),
                  gps_data->latitude, gps_data->longitude,
+                 gps_data->altitude, gps_data->speed,
                  imu_data->accel_x, imu_data->accel_y, imu_data->accel_z,
                  g_own_mac_str);
         sd_append_record(sync_rec);
@@ -1204,74 +1153,161 @@ static void initialize_sntp(void)
 
 /* ==================== HTTP Server ==================== */
 
+// Emit a single table row with a download link; silently skips if file absent.
+static void http_emit_file_row(httpd_req_t *req, const char *display, const char *full_path)
+{
+    struct stat st;
+    if (stat(full_path, &st) != 0) return;
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+             "<tr><td><a href='/download?path=%s'>%s</a></td>"
+             "<td style='padding-left:16px;color:#888'>%ld B</td></tr>",
+             full_path, display, st.st_size);
+    httpd_resp_sendstr_chunk(req, buf);
+}
+
 static esp_err_t http_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr_chunk(req, "<html><head><title>GPS Logger</title></head><body>");
-    httpd_resp_sendstr_chunk(req, "<h1>GPS Log Files</h1><ul>");
-    
-    struct dirent *entry;
+    httpd_resp_sendstr_chunk(req,
+        "<html><head><title>GPS Logger</title>"
+        "<style>body{font-family:monospace;padding:16px;max-width:700px}"
+        "h1{border-bottom:1px solid #ccc;padding-bottom:8px}"
+        "h2{margin-top:24px;color:#444}table{border-collapse:collapse;width:100%}"
+        "td{padding:4px 0}a{color:#0066cc}"
+        ".danger{background:#c0392b;color:#fff;border:none;padding:8px 16px;"
+        "font-family:monospace;font-size:14px;cursor:pointer;border-radius:3px}"
+        ".danger:hover{background:#a93226}</style></head><body>");
+    httpd_resp_sendstr_chunk(req, "<h1>GPS Logger</h1>");
+
+    // \u2500\u2500 GPS daily logs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    httpd_resp_sendstr_chunk(req, "<h2>GPS Daily Logs</h2><table>");
     DIR *dir = opendir(GPS_DIR);
-    
-    if (dir != NULL) {
+    if (dir) {
+        struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_type == DT_REG) {
-                char filepath[384];
-                snprintf(filepath, sizeof(filepath), "%s/%s", GPS_DIR, entry->d_name);
-                
-                struct stat st;
-                if (stat(filepath, &st) == 0) {
-                    char line[640];
-                    snprintf(line, sizeof(line), 
-                             "<li><a href='/download?file=%s'>%s</a> (%ld bytes)</li>",
-                             entry->d_name, entry->d_name, st.st_size);
-                    httpd_resp_sendstr_chunk(req, line);
-                }
+                char full[384];
+                snprintf(full, sizeof(full), "%s/%s", GPS_DIR, entry->d_name);
+                http_emit_file_row(req, entry->d_name, full);
             }
         }
         closedir(dir);
+    } else {
+        httpd_resp_sendstr_chunk(req, "<tr><td><i>No GPS logs yet</i></td></tr>");
     }
-    
-    httpd_resp_sendstr_chunk(req, "</ul></body></html>");
+    httpd_resp_sendstr_chunk(req, "</table>");
+
+    // \u2500\u2500 Sync files \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    httpd_resp_sendstr_chunk(req, "<h2>Sync Files</h2><table>");
+    http_emit_file_row(req, "sync_data.csv",   CSV_DATA_FILE);
+    http_emit_file_row(req, "sync_merged.csv", CSV_MERGED_FILE);
+    httpd_resp_sendstr_chunk(req, "</table>");
+
+    // \u2500\u2500 Connection log \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    httpd_resp_sendstr_chunk(req, "<h2>Connection Log</h2><table>");
+    http_emit_file_row(req, "connections.csv", CONNECTIONS_LOG_FILE);
+    httpd_resp_sendstr_chunk(req, "</table>");
+
+    // \u2500\u2500 Clear all data \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    httpd_resp_sendstr_chunk(req,
+        "<h2>Actions</h2>"
+        "<form method='POST' action='/clear' "
+        "onsubmit=\"return confirm('Delete all log files? This cannot be undone.');\">" 
+        "<button type='submit' class='danger'>Clear all data</button>"
+        "</form>");
+
+    httpd_resp_sendstr_chunk(req, "</body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
 
 static esp_err_t http_download_handler(httpd_req_t *req)
 {
-    char query[128];
-    char filename[256];
-    
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        if (httpd_query_key_value(query, "file", filename, sizeof(filename)) == ESP_OK) {
-            char filepath[384];
-            snprintf(filepath, sizeof(filepath), "%s/%s", GPS_DIR, filename);
-            
-            FILE *f = fopen(filepath, "r");
-            if (f == NULL) {
-                httpd_resp_send_404(req);
-                return ESP_FAIL;
-            }
-            
-            httpd_resp_set_type(req, "text/csv");
-            
-            char buffer[512];
-            size_t read_bytes;
-            while ((read_bytes = fread(buffer, 1, sizeof(buffer), f)) > 0) {
-                if (httpd_resp_send_chunk(req, buffer, read_bytes) != ESP_OK) {
-                    fclose(f);
-                    return ESP_FAIL;
-                }
-            }
-            
+    char query[512];
+    char raw_path[384];
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "path", raw_path, sizeof(raw_path)) != ESP_OK) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Security: reject path traversal sequences
+    if (strstr(raw_path, "..") != NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+
+    // Security: path must be within the SD mount point
+    if (strncmp(raw_path, SD_MOUNT_POINT, strlen(SD_MOUNT_POINT)) != 0) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access denied");
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(raw_path, "r");
+    if (f == NULL) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/csv");
+
+    // Suggest a download filename for the browser
+    const char *basename = strrchr(raw_path, '/');
+    if (basename) {
+        char cd[160];
+        snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", basename + 1);
+        httpd_resp_set_hdr(req, "Content-Disposition", cd);
+    }
+
+    char buffer[512];
+    size_t read_bytes;
+    while ((read_bytes = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buffer, read_bytes) != ESP_OK) {
             fclose(f);
-            httpd_resp_send_chunk(req, NULL, 0);
-            return ESP_OK;
+            return ESP_FAIL;
         }
     }
-    
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
+
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t http_clear_handler(httpd_req_t *req)
+{
+    // Delete all GPS daily log files
+    DIR *dir = opendir(GPS_DIR);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_REG) {
+                char full[384];
+                snprintf(full, sizeof(full), "%s/%s", GPS_DIR, entry->d_name);
+                remove(full);
+            }
+        }
+        closedir(dir);
+    }
+
+    // Truncate sync files back to header-only
+    sd_delete_data_file();
+    sd_ensure_data_file();
+    sd_delete_merged_file();
+    sd_ensure_merged_file();
+    espnow_sync_reset_peer_states();
+
+    // Delete connection log
+    remove(CONNECTIONS_LOG_FILE);
+
+    ESP_LOGI(TAG, "All log files cleared via web interface");
+
+    // Redirect back to the index page
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
 }
 
 static esp_err_t http_status_handler(httpd_req_t *req)
@@ -1316,7 +1352,15 @@ static httpd_handle_t start_webserver(void)
             .user_ctx  = NULL
         };
         httpd_register_uri_handler(server, &uri_status);
-        
+
+        httpd_uri_t uri_clear = {
+            .uri       = "/clear",
+            .method    = HTTP_POST,
+            .handler   = http_clear_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &uri_clear);
+
         ESP_LOGI(TAG, "HTTP server started");
     }
     
@@ -1486,9 +1530,7 @@ static void gps_logging_task(void *pvParameters)
 /* ==================== Motion Detection ==================== */
 
 // Thresholds for deciding the device is stationary
-#define GPS_STATIC_SPEED_KMH  2.0f    // km/h – below this speed = stationary
-#define IMU_ACCEL_DEVIATION   0.15f   // g deviation from 1g = stationary
-#define IMU_GYRO_STATIC_DPS   5.0f    // deg/s below this = stationary
+// GPS_STATIC_SPEED_KMH, IMU_ACCEL_DEVIATION, IMU_GYRO_STATIC_DPS — defined in sync_config.h
 #define STATIC_REQUIRED_MS    5000    // ms of continuous stillness before sync
 
 // Returns true when the device is confirmed (or assumed) to be stationary.

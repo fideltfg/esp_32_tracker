@@ -153,7 +153,7 @@ static bool send_frame(const uint8_t *peer_mac, espnow_frame_t *frame,
 // Row offsets are advanced only after DONE is successfully acknowledged.
 // The receiver's per-MAC high-water-mark dedup handles any rows the peer
 // already obtained via a different path.
-static bool stream_csv_to_peer(const uint8_t *peer_mac)
+static int stream_csv_to_peer(const uint8_t *peer_mac)
 {
     PeerSyncState *state       = get_peer_state(peer_mac);
     int data_start   = state ? state->last_data_row   : 0;
@@ -179,7 +179,7 @@ static bool stream_csv_to_peer(const uint8_t *peer_mac)
             size_t ll = strlen(line);
             if (fill > 0 && fill + ll > ESPNOW_DATA_PAYLOAD) {
                 frame.type = MSG_DATA; frame.seq = seq++;
-                if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return false; }
+                if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return -1; }
                 total_sent += fill; fill = 0;
             }
             if (ll > ESPNOW_DATA_PAYLOAD) ll = ESPNOW_DATA_PAYLOAD;
@@ -201,7 +201,7 @@ static bool stream_csv_to_peer(const uint8_t *peer_mac)
             size_t ll = strlen(line);
             if (fill > 0 && fill + ll > ESPNOW_DATA_PAYLOAD) {
                 frame.type = MSG_DATA; frame.seq = seq++;
-                if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return false; }
+                if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return -1; }
                 total_sent += fill; fill = 0;
             }
             if (ll > ESPNOW_DATA_PAYLOAD) ll = ESPNOW_DATA_PAYLOAD;
@@ -215,13 +215,13 @@ static bool stream_csv_to_peer(const uint8_t *peer_mac)
     // ── Flush remainder ───────────────────────────────────────────────────
     if (fill > 0) {
         frame.type = MSG_DATA; frame.seq = seq++;
-        if (!send_frame(peer_mac, &frame, fill)) return false;
+        if (!send_frame(peer_mac, &frame, fill)) return -1;
         total_sent += fill;
     }
 
-    // ── Send DONE; advance offsets only on success ────────────────────────
+    // ── Send DONE; advance offsets only on success ────────────────────
     espnow_frame_t done = { .type = MSG_DONE, .seq = seq, .length = 0 };
-    if (!send_frame(peer_mac, &done, 0)) return false;
+    if (!send_frame(peer_mac, &done, 0)) return -1;
 
     if (state) {
         state->last_data_row   += data_rows_sent;
@@ -233,7 +233,7 @@ static bool stream_csv_to_peer(const uint8_t *peer_mac)
              data_rows_sent, merged_rows_sent, total_sent, MAC2STR(peer_mac),
              data_start, data_start + data_rows_sent - 1,
              merged_start, merged_start + merged_rows_sent - 1);
-    return true;
+    return data_rows_sent + merged_rows_sent;
 }
 
 // ─── Receive CSV data from a peer ─────────────────────────────────────────────
@@ -409,14 +409,18 @@ int espnow_sync_round(void)
             if (!send_frame(item.src_mac, &req, 6)) continue;
 
             // Receive their CSV
-            int added = receive_and_merge_from_peer(item.src_mac);
-            if (added >= 0) {
+            int records_rx = receive_and_merge_from_peer(item.src_mac);
+            if (records_rx >= 0) {
                 ESP_LOGI(TAG, "Merged %d new records from " MACSTR,
-                         added, MAC2STR(item.src_mac));
+                         records_rx, MAC2STR(item.src_mac));
             }
 
             // Send our CSV back
-            stream_csv_to_peer(item.src_mac);
+            int records_tx = stream_csv_to_peer(item.src_mac);
+
+            sd_log_connection(item.src_mac,
+                              records_rx  >= 0 ? records_rx  : 0,
+                              records_tx  >= 0 ? records_tx  : 0);
 
             if (synced_count < 20) {
                 memcpy(synced_peers[synced_count++], item.src_mac, 6);
@@ -427,13 +431,17 @@ int espnow_sync_round(void)
             ESP_LOGI(TAG, "Peer SYNC_REQ from " MACSTR, MAC2STR(item.src_mac));
 
             // They requested our data first – stream ours, then receive theirs
-            stream_csv_to_peer(item.src_mac);
+            int records_tx = stream_csv_to_peer(item.src_mac);
 
-            int added = receive_and_merge_from_peer(item.src_mac);
-            if (added >= 0) {
+            int records_rx = receive_and_merge_from_peer(item.src_mac);
+            if (records_rx >= 0) {
                 ESP_LOGI(TAG, "Merged %d new records from " MACSTR,
-                         added, MAC2STR(item.src_mac));
+                         records_rx, MAC2STR(item.src_mac));
             }
+
+            sd_log_connection(item.src_mac,
+                              records_rx >= 0 ? records_rx : 0,
+                              records_tx >= 0 ? records_tx : 0);
 
             if (synced_count < 20) {
                 memcpy(synced_peers[synced_count++], item.src_mac, 6);

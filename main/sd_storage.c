@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include "esp_log.h"
@@ -238,4 +239,39 @@ int sd_read_all(char *buf, size_t buf_size)
     fclose(f);
     sd_unlock();
     return (int)n;
+}
+
+// ─── Connection log ───────────────────────────────────────────────────────────
+
+bool sd_log_connection(const uint8_t *peer_mac, int records_rx, int records_tx)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+
+    char line[128];
+    snprintf(line, sizeof(line),
+             "%04d-%02d-%02dT%02d:%02d:%02d,%02X:%02X:%02X:%02X:%02X:%02X,%d,%d\n",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             peer_mac[0], peer_mac[1], peer_mac[2],
+             peer_mac[3], peer_mac[4], peer_mac[5],
+             records_rx, records_tx);
+
+    sd_lock();
+    struct stat st;
+    bool needs_header = (stat(CONNECTIONS_LOG_FILE, &st) != 0);
+    FILE *f = fopen(CONNECTIONS_LOG_FILE, "a");
+    if (!f) {
+        ESP_LOGE(TAG, "Cannot open %s for append", CONNECTIONS_LOG_FILE);
+        sd_unlock();
+        return false;
+    }
+    if (needs_header) {
+        fputs("timestamp,peer_mac,records_rx,records_tx\n", f);
+    }
+    bool ok = (fputs(line, f) >= 0);
+    fclose(f);
+    sd_unlock();
+    return ok;
 }
