@@ -3,6 +3,9 @@
 .AppleDouble
 .LSOverride
 
+# VS Code workspace settings (machine-specific)
+.vscode/
+
 # Directory metadata
 .directory
 
