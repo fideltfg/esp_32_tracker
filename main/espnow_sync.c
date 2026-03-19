@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <stdio.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -53,17 +55,17 @@ static SemaphoreHandle_t s_tx_done = NULL; // signalled by the TX callback
 static uint8_t        s_own_mac[6];
 
 // ─── Per-peer delta-sync state ────────────────────────────────────────────────
-// Tracks how many data rows have already been sent to each peer from data.csv.
-// Only NEW rows (beyond last_sent_row) are transmitted each sync round,
-// so bandwidth and merged.csv growth are proportional to new records only.
-// This array outlives espnow_deinit/init cycles (module-level static).
-// Call espnow_sync_reset_peer_states() whenever data.csv is cleared so
-// the row offsets start from 0 again on the fresh file.
+// Tracks the timestamp watermark and merged.csv row offset for each known peer.
+// Only new GPS rows (timestamp > last_sent_timestamp, fix==1) from sync_data.csv
+// and new merged.csv rows (beyond last_merged_row) are transmitted each
+// sync round, keeping bandwidth proportional to new records only.
+// Call espnow_sync_reset_peer_states() whenever the data files are cleared so
+// the watermarks restart from zero on the fresh files.
 #define MAX_SYNC_PEERS 8
 typedef struct {
     uint8_t mac[6];
-    int last_data_row;    // rows of data.csv already sent to this peer
-    int last_merged_row;  // rows of merged.csv already sent to this peer
+    int64_t last_sent_timestamp; // Unix epoch of last own GPS row sent to this peer
+    int     last_merged_row;     // rows of merged.csv already sent to this peer
 } PeerSyncState;
 static PeerSyncState s_peer_states[MAX_SYNC_PEERS];
 static int           s_peer_state_count = 0;
@@ -76,11 +78,11 @@ static PeerSyncState *get_peer_state(const uint8_t *mac)
     if (s_peer_state_count < MAX_SYNC_PEERS) {
         PeerSyncState *p = &s_peer_states[s_peer_state_count++];
         memcpy(p->mac, mac, 6);
-        p->last_data_row   = 0;
-        p->last_merged_row = 0;
+        p->last_sent_timestamp = 0;
+        p->last_merged_row     = 0;
         return p;
     }
-    return NULL; // table full – caller falls back to start_row=0
+    return NULL; // table full – caller falls back to defaults
 }
 
 // ─── ESP-NOW TX-done callback (called from WiFi task after each send) ────────
@@ -144,58 +146,54 @@ static bool send_frame(const uint8_t *peer_mac, espnow_frame_t *frame,
 
 // ─── Stream CSV delta to a peer ───────────────────────────────────────────────
 // Sends two deltas in a single stream (shared sequence counter, single DONE):
-//   1. Rows from data.csv  not yet sent to this peer  (own records)
-//   2. Rows from merged.csv not yet sent to this peer  (forwarded peer records)
-//
-// This enables multi-hop propagation: device C forwards device A's rows to
-// device B even if A and B have never met directly.
-//
-// Row offsets are advanced only after DONE is successfully acknowledged.
-// The receiver's per-MAC high-water-mark dedup handles any rows the peer
-// already obtained via a different path.
+//   1. Rows from sync_data.csv where timestamp > last_sent_timestamp
+//   2. Rows from merged.csv not yet sent to this peer (forwarded peer records).
 static int stream_csv_to_peer(const uint8_t *peer_mac)
 {
-    PeerSyncState *state       = get_peer_state(peer_mac);
-    int data_start   = state ? state->last_data_row   : 0;
-    int merged_start = state ? state->last_merged_row : 0;
+    PeerSyncState *state        = get_peer_state(peer_mac);
+    int64_t send_from_ts        = state ? state->last_sent_timestamp : 0;
+    int     merged_start        = state ? state->last_merged_row      : 0;
 
     uint8_t seq              = 0;
     size_t  total_sent       = 0;
-    int     data_rows_sent   = 0;
+    int     gps_rows_sent    = 0;
     int     merged_rows_sent = 0;
+    int64_t max_ts_sent      = send_from_ts;
 
     espnow_frame_t frame;
     size_t fill = 0;
     char   line[256];
 
-    // ── 1. Stream data.csv delta ──────────────────────────────────────────
-    FILE *f = fopen(CSV_DATA_FILE, "r");
-    if (f) {
-        int skipped = 0;
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "timestamp", 9) == 0) continue; // header
-            if (skipped < data_start) { skipped++; continue; }
+    // ── 1. Stream own GPS rows from sync_data.csv ─────────────────────────
+    {
+        FILE *f = fopen(CSV_DATA_FILE, "r");
+        if (f) {
+            while (fgets(line, sizeof(line), f)) {
+                if (!strchr(line, ',')) continue;
+                int64_t ts = (int64_t)strtoll(line, NULL, 10);
+                if (ts <= send_from_ts) continue; // already sent in a prior round
 
-            size_t ll = strlen(line);
-            if (fill > 0 && fill + ll > ESPNOW_DATA_PAYLOAD) {
-                frame.type = MSG_DATA; frame.seq = seq++;
-                if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return -1; }
-                total_sent += fill; fill = 0;
+                size_t ll = strlen(line);
+                if (fill > 0 && fill + ll > ESPNOW_DATA_PAYLOAD) {
+                    frame.type = MSG_DATA; frame.seq = seq++;
+                    if (!send_frame(peer_mac, &frame, fill)) { fclose(f); return -1; }
+                    total_sent += fill; fill = 0;
+                }
+                if (ll > ESPNOW_DATA_PAYLOAD) ll = ESPNOW_DATA_PAYLOAD;
+                memcpy(frame.payload + fill, line, ll);
+                fill += ll;
+                gps_rows_sent++;
+                if (ts > max_ts_sent) max_ts_sent = ts;
             }
-            if (ll > ESPNOW_DATA_PAYLOAD) ll = ESPNOW_DATA_PAYLOAD;
-            memcpy(frame.payload + fill, line, ll);
-            fill += ll;
-            data_rows_sent++;
+            fclose(f);
         }
-        fclose(f);
     }
 
     // ── 2. Stream merged.csv delta ────────────────────────────────────────
-    f = fopen(CSV_MERGED_FILE, "r");
+    FILE *f = fopen(CSV_MERGED_FILE, "r");
     if (f) {
         int skipped = 0;
         while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "timestamp", 9) == 0) continue; // header
             if (skipped < merged_start) { skipped++; continue; }
 
             size_t ll = strlen(line);
@@ -219,21 +217,20 @@ static int stream_csv_to_peer(const uint8_t *peer_mac)
         total_sent += fill;
     }
 
-    // ── Send DONE; advance offsets only on success ────────────────────
+    // ── Send DONE; advance offsets only on success ────────────────────────
     espnow_frame_t done = { .type = MSG_DONE, .seq = seq, .length = 0 };
     if (!send_frame(peer_mac, &done, 0)) return -1;
 
     if (state) {
-        state->last_data_row   += data_rows_sent;
-        state->last_merged_row += merged_rows_sent;
+        state->last_sent_timestamp  = max_ts_sent;
+        state->last_merged_row     += merged_rows_sent;
     }
 
-    ESP_LOGI(TAG, "Sent %d own + %d forwarded rows (%zu B) to " MACSTR
-             " [data:%d-%d, merged:%d-%d]",
-             data_rows_sent, merged_rows_sent, total_sent, MAC2STR(peer_mac),
-             data_start, data_start + data_rows_sent - 1,
-             merged_start, merged_start + merged_rows_sent - 1);
-    return data_rows_sent + merged_rows_sent;
+    ESP_LOGI(TAG, "Sent %d GPS + %d forwarded rows (%zu B) to " MACSTR
+             " [ts_hwm:%" PRId64 ", merged:%d-%d]",
+             gps_rows_sent, merged_rows_sent, total_sent, MAC2STR(peer_mac),
+             max_ts_sent, merged_start, merged_start + merged_rows_sent - 1);
+    return gps_rows_sent + merged_rows_sent;
 }
 
 // ─── Receive CSV data from a peer ─────────────────────────────────────────────
@@ -296,7 +293,11 @@ static int receive_and_merge_from_peer(const uint8_t *peer_mac)
     ESP_LOGI(TAG, "Received %zu bytes from " MACSTR ", merging...",
              bytes_written, MAC2STR(peer_mac));
 
-    int merged = data_merge_from_file(CSV_MERGE_TMP); // appends to merged.csv
+    // Format own device MAC as 4-char hex string to filter echo-back rows
+    char own_mac_str[5];
+    snprintf(own_mac_str, sizeof(own_mac_str), "%02X%02X", s_own_mac[4], s_own_mac[5]);
+
+    int merged = data_merge_from_file(CSV_MERGE_TMP, own_mac_str);
     remove(CSV_MERGE_TMP);
     return merged;
 }
@@ -360,7 +361,7 @@ void espnow_deinit(void)
 void espnow_sync_reset_peer_states(void)
 {
     s_peer_state_count = 0;
-    ESP_LOGI(TAG, "Per-peer send offsets cleared (data.csv was reset)");
+    ESP_LOGI(TAG, "Per-peer sync state cleared");
 }
 
 int espnow_sync_round(void)

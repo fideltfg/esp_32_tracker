@@ -56,7 +56,6 @@
 #define SDMMC_CLK_GPIO   14
 #define SDMMC_D0_GPIO    2
 #define SD_MOUNT_POINT   "/sdcard"
-#define GPS_DIR          SD_MOUNT_POINT "/gps"
 
 // ─── Button ──────────────────────────────────────────────────────────────────
 #define BUTTON_GPIO      0      // BOOT button on most ESP32 boards
@@ -69,9 +68,6 @@
 #define CSV_DATA_FILE    SD_MOUNT_POINT "/sync_data.csv"
 #define CSV_MERGED_FILE  SD_MOUNT_POINT "/sync_merged.csv"
 #define CSV_MERGE_TMP    SD_MOUNT_POINT "/sync_tmp.csv"
-
-// CSV column layout for records exchanged via ESP-NOW.
-#define CSV_HEADER  "timestamp,lat,lon,accel_x,accel_y,accel_z,device_mac\n"
 
 // ─── Motion detection thresholds ─────────────────────────────────────────────
 #define GPS_STATIC_SPEED_KMH  2.0f    // km/h  — below this = stationary

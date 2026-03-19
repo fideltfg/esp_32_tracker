@@ -109,7 +109,6 @@ bool sd_ensure_data_file(void)
         sd_unlock();
         return false;
     }
-    fputs(CSV_HEADER, f);
     fclose(f);
     sd_unlock();
     ESP_LOGI(TAG, "Created %s", CSV_DATA_FILE);
@@ -140,9 +139,7 @@ int sd_record_count(void)
 
     int count = 0;
     char line[256];
-    bool first = true;
     while (fgets(line, sizeof(line), f)) {
-        if (first) { first = false; continue; } // skip header
         if (line[0] != '\n' && line[0] != '\r' && line[0] != '\0') {
             count++;
         }
@@ -175,7 +172,6 @@ bool sd_ensure_merged_file(void)
         sd_unlock();
         return false;
     }
-    fputs(CSV_HEADER, f);
     fclose(f);
     sd_unlock();
     ESP_LOGI(TAG, "Created %s", CSV_MERGED_FILE);

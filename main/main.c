@@ -5,7 +5,7 @@
  * - GPS tracking with Neo-6M module
  * - IMU data logging with MPU6050/MPU6500/MPU9250
  * - RTC timekeeping with DS3231
- * - SD card storage with daily CSV files
+ * - SD card storage with CSV files
  * - WiFi connectivity and NTP sync
  * - HTTP server for file access
  */
@@ -18,7 +18,6 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
-#include <dirent.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -965,16 +964,6 @@ static esp_err_t sd_card_init(void)
     
     sdmmc_card_print_info(stdout, card);
     
-    // Create GPS directory if it doesn't exist
-    struct stat st;
-    if (stat(GPS_DIR, &st) != 0) {
-        if (mkdir(GPS_DIR, 0775) != 0) {
-            ESP_LOGE(TAG, "Failed to create directory: %s (errno %d)", GPS_DIR, errno);
-        } else {
-            ESP_LOGI(TAG, "Created directory: %s", GPS_DIR);
-        }
-    }
-    
     return ESP_OK;
 }
 
@@ -982,71 +971,21 @@ static esp_err_t sd_card_init(void)
 
 static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_data)
 {
-    struct tm timeinfo;
-    if (rtc_get_time(&timeinfo) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get time from RTC");
-        return ESP_FAIL;
-    }
-    
-    char filename[64];
-    snprintf(filename, sizeof(filename), "%s/%04d_%02d_%02d.csv",
-             GPS_DIR,
-             timeinfo.tm_year + 1900,
-             timeinfo.tm_mon + 1,
-             timeinfo.tm_mday);
-    
-    // Ensure GPS directory exists (may have been lost if SD card was re-mounted)
-    struct stat st;
-    if (stat(GPS_DIR, &st) != 0) {
-        if (mkdir(GPS_DIR, 0775) != 0) {
-            ESP_LOGE(TAG, "Failed to create directory: %s (errno %d)", GPS_DIR, errno);
-            return ESP_FAIL;
-        }
-        ESP_LOGI(TAG, "Re-created directory: %s", GPS_DIR);
-    }
+    char row[128];
+    bool gps_valid = gps_data->valid;
+    snprintf(row, sizeof(row),
+             "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
+             (int64_t)time(NULL),
+             gps_valid ? gps_data->latitude  : 0.0,
+             gps_valid ? gps_data->longitude : 0.0,
+             gps_valid ? gps_data->altitude  : 0.0f,
+             gps_valid ? gps_data->speed     : 0.0f,
+             imu_data->accel_x,
+             imu_data->accel_y,
+             imu_data->accel_z,
+             g_own_mac_str);
 
-    // Check if file exists to determine if we need to write header
-    bool file_exists = (access(filename, F_OK) == 0);
-    
-    FILE *f = fopen(filename, "a");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s (errno %d)", filename, errno);
-        return ESP_FAIL;
-    }
-    
-    // Write header if new file
-    if (!file_exists) {
-        fprintf(f, "timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z,device_mac\n");
-    }
-
-    // Write data — same schema as sync_data.csv so all logs are consistent
-    fprintf(f, "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
-            (int64_t)time(NULL),
-            gps_data->latitude,
-            gps_data->longitude,
-            gps_data->altitude,
-            gps_data->speed,
-            imu_data->accel_x,
-            imu_data->accel_y,
-            imu_data->accel_z,
-            g_own_mac_str);
-
-    fclose(f);
-
-    // Also append to sync_data.csv for ESP-NOW peer exchange and server upload.
-    if (g_own_mac_str[0] != '\0') {
-        char sync_rec[160];
-        snprintf(sync_rec, sizeof(sync_rec),
-                 "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
-                 (int64_t)time(NULL),
-                 gps_data->latitude, gps_data->longitude,
-                 gps_data->altitude, gps_data->speed,
-                 imu_data->accel_x, imu_data->accel_y, imu_data->accel_z,
-                 g_own_mac_str);
-        sd_append_record(sync_rec);
-    }
-
-    return ESP_OK;
+    return sd_append_record(row) ? ESP_OK : ESP_FAIL;
 }
 
 /* ==================== WiFi Functions ==================== */
@@ -1180,23 +1119,12 @@ static esp_err_t http_get_handler(httpd_req_t *req)
         ".danger:hover{background:#a93226}</style></head><body>");
     httpd_resp_sendstr_chunk(req, "<h1>GPS Logger</h1>");
 
-    // \u2500\u2500 GPS daily logs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    httpd_resp_sendstr_chunk(req, "<h2>GPS Daily Logs</h2><table>");
-    DIR *dir = opendir(GPS_DIR);
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG) {
-                char full[384];
-                snprintf(full, sizeof(full), "%s/%s", GPS_DIR, entry->d_name);
-                http_emit_file_row(req, entry->d_name, full);
-            }
-        }
-        closedir(dir);
-    } else {
-        httpd_resp_sendstr_chunk(req, "<tr><td><i>No GPS logs yet</i></td></tr>");
-    }
-    httpd_resp_sendstr_chunk(req, "</table>");
+    // Device identity line
+    char mac_line[96];
+    snprintf(mac_line, sizeof(mac_line),
+             "<p style='color:#555;margin-top:0'>Device MAC: <strong>%s</strong></p>",
+             g_own_mac_str[0] ? g_own_mac_str : "unknown");
+    httpd_resp_sendstr_chunk(req, mac_line);
 
     // \u2500\u2500 Sync files \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     httpd_resp_sendstr_chunk(req, "<h2>Sync Files</h2><table>");
@@ -1277,20 +1205,6 @@ static esp_err_t http_download_handler(httpd_req_t *req)
 
 static esp_err_t http_clear_handler(httpd_req_t *req)
 {
-    // Delete all GPS daily log files
-    DIR *dir = opendir(GPS_DIR);
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG) {
-                char full[384];
-                snprintf(full, sizeof(full), "%s/%s", GPS_DIR, entry->d_name);
-                remove(full);
-            }
-        }
-        closedir(dir);
-    }
-
     // Truncate sync files back to header-only
     sd_delete_data_file();
     sd_ensure_data_file();
@@ -1379,6 +1293,10 @@ static void gps_logging_task(void *pvParameters)
     imu_data_t imu_data = {0};
     uint8_t last_display_mode = 0;
     uint32_t lcd_resync_counter = 0;
+
+    // EMA filter state — smooths GPS lat/lon/alt while the device is stationary
+    float ema_lat = 0.0f, ema_lon = 0.0f, ema_alt = 0.0f;
+    bool  ema_initialized = false;
     
     ESP_LOGI(TAG, "GPS logging task started");
     
@@ -1435,6 +1353,44 @@ static void gps_logging_task(void *pvParameters)
         }
 #endif
 
+        // ── GPS position jitter filter ────────────────────────────────────────
+        // The Neo-6M reports position noise of several meters even when still.
+        // When both IMU and GPS speed agree the device is stationary, apply an
+        // EMA to the logged coordinates so the track doesn't wander.
+        // When motion is detected we snap the filter to the raw position so the
+        // first logged point after moving is accurate.
+        gps_data_t log_gps = gps_data;  // filtered copy used for CSV / LCD
+        if (gps_data.valid) {
+            float am = sqrtf(imu_data.accel_x * imu_data.accel_x +
+                             imu_data.accel_y * imu_data.accel_y +
+                             imu_data.accel_z * imu_data.accel_z);
+            float gm = sqrtf(imu_data.gyro_x  * imu_data.gyro_x  +
+                             imu_data.gyro_y  * imu_data.gyro_y  +
+                             imu_data.gyro_z  * imu_data.gyro_z);
+            bool stationary = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
+                              (gm < IMU_GYRO_STATIC_DPS) &&
+                              (gps_data.speed < GPS_STATIC_SPEED_KMH);
+
+            if (!ema_initialized) {
+                ema_lat = gps_data.latitude;
+                ema_lon = gps_data.longitude;
+                ema_alt = gps_data.altitude;
+                ema_initialized = true;
+            } else if (stationary) {
+                ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0f - GPS_EMA_ALPHA) * ema_lat;
+                ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0f - GPS_EMA_ALPHA) * ema_lon;
+                ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
+                log_gps.latitude  = ema_lat;
+                log_gps.longitude = ema_lon;
+                log_gps.altitude  = ema_alt;
+            } else {
+                // Moving — snap filter to raw position so tracking stays responsive
+                ema_lat = gps_data.latitude;
+                ema_lon = gps_data.longitude;
+                ema_alt = gps_data.altitude;
+            }
+        }
+
         // Log data if GPS is valid
         if (gps_data.valid) {
             // Set timezone from GPS on first valid fix
@@ -1454,10 +1410,10 @@ static void gps_logging_task(void *pvParameters)
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             }
             
-            if (log_to_csv(&gps_data, &imu_data) == ESP_OK) {
+            if (log_to_csv(&log_gps, &imu_data) == ESP_OK) {
                 ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
-                         gps_data.latitude, gps_data.longitude,
-                         gps_data.altitude, gps_data.speed,
+                         log_gps.latitude, log_gps.longitude,
+                         log_gps.altitude, log_gps.speed,
                          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
             }
             
@@ -1472,8 +1428,8 @@ static void gps_logging_task(void *pvParameters)
                 
                 if (display_mode == 0) {
                     // GPS/IMU mode
-                    lcd_printf(0, 0, "%.1fkm %.1fm", gps_data.speed, gps_data.altitude);
-                    lcd_printf(0, 1, "%.2f,%.2f", gps_data.latitude, gps_data.longitude);
+                    lcd_printf(0, 0, "%.1fkm %.1fm", log_gps.speed, log_gps.altitude);
+                    lcd_printf(0, 1, "%.2f,%.2f", log_gps.latitude, log_gps.longitude);
                 } else {
                     // Time/IP mode
                     char date_str[17], time_str[17], ip_str[17];
@@ -1484,6 +1440,11 @@ static void gps_logging_task(void *pvParameters)
                 }
             }
         } else {
+            // No GPS fix — log a local-only entry (fix=0) with available IMU data.
+            // These rows are written to sync_data.csv but not streamed to peers.
+            if (log_to_csv(&log_gps, &imu_data) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to write no-fix log entry");
+            }
             ESP_LOGW(TAG, "Waiting for GPS fix... (accel: %.3f, %.3f, %.3f g)",
                      imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
             
@@ -1512,12 +1473,12 @@ static void gps_logging_task(void *pvParameters)
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Log every second
-        
-        // Resync LCD every 5 seconds to silently fix any nibble misalignment
+        vTaskDelay(pdMS_TO_TICKS(LOG_INTERVAL_MS));
+
+        // Resync LCD every ~5 seconds to silently fix any nibble misalignment
         if (lcd_initialized && lcd_display_on) {
             lcd_resync_counter++;
-            if (lcd_resync_counter >= 5) {
+            if (lcd_resync_counter >= (5000 / LOG_INTERVAL_MS)) {
                 lcd_resync_counter = 0;
                 lcd_resync();
             }

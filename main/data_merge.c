@@ -51,15 +51,13 @@ static void load_max_timestamps(const char *path,
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
-    bool first = true;
     while (fgets(line, sizeof(line), f)) {
-        if (first) { first = false; continue; } // skip header
         line[strcspn(line, "\r\n")] = '\0';
         if (line[0] == '\0') continue;
 
         char ts_str[24], mac[5];
         if (!csv_field(line, 0, ts_str, sizeof(ts_str))) continue;
-        if (!csv_field(line, 6, mac,    sizeof(mac)))    continue;
+        if (!csv_field(line, 8, mac,    sizeof(mac)))    continue;
         int64_t ts = (int64_t)strtoll(ts_str, NULL, 10);
 
         int idx = -1;
@@ -80,7 +78,7 @@ static void load_max_timestamps(const char *path,
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-int data_merge_from_file(const char *incoming_path)
+int data_merge_from_file(const char *incoming_path, const char *skip_mac)
 {
     sd_lock();
 
@@ -108,8 +106,6 @@ int data_merge_from_file(const char *incoming_path)
     char line[256];
 
     while (fgets(line, sizeof(line), in)) {
-        // Skip stray header
-        if (strncmp(line, "timestamp", 9) == 0) continue;
         if (line[0] == '\n' || line[0] == '\r' || line[0] == '\0') continue;
 
         // Ensure trailing newline
@@ -118,11 +114,17 @@ int data_merge_from_file(const char *incoming_path)
 
         char ts_str[24], mac[5];
         if (!csv_field(line, 0, ts_str, sizeof(ts_str)) ||
-            !csv_field(line, 6, mac,    sizeof(mac))) {
+            !csv_field(line, 8, mac,    sizeof(mac))) {
             ESP_LOGW(TAG, "Skipping malformed line: %.60s", line);
             continue;
         }
         int64_t ts = (int64_t)strtoll(ts_str, NULL, 10);
+
+        // Skip rows belonging to our own device (prevent multi-hop echo)
+        if (skip_mac && strcmp(mac, skip_mac) == 0) {
+            skipped++;
+            continue;
+        }
 
         // Find or create tracker for this MAC
         int idx = -1;

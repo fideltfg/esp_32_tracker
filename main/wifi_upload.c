@@ -13,6 +13,11 @@
 #include "esp_http_client.h"
 #include "nvs_flash.h"
 
+// esp_crt_bundle_attach lives in the esp_tls component whose include path is
+// not exposed to main; forward-declare the symbol so the compiler accepts it
+// (the linker will resolve it via esp_http_client → esp_tls).
+esp_err_t esp_crt_bundle_attach(void *conf);
+
 static const char *TAG = "wifi_upload";
 
 // Bit flags for event group
@@ -142,8 +147,8 @@ static char *csv_to_json(const char *csv, int csv_len)
     for (int i = 0; i < csv_len; i++) {
         if (csv[i] == '\n') newlines++;
     }
-    // newlines - 1 data rows (subtract header), 160 bytes each + brackets
-    size_t json_cap = (size_t)(newlines > 1 ? newlines : 2) * 160 + 8;
+    // one buffer slot per data row, 220 bytes each + brackets
+    size_t json_cap = (size_t)(newlines > 1 ? newlines : 2) * 220 + 8;
     char *json = malloc(json_cap);
     if (!json) return NULL;
 
@@ -158,7 +163,6 @@ static char *csv_to_json(const char *csv, int csv_len)
     memcpy(buf, csv, csv_len);
     buf[csv_len] = '\0';
 
-    bool first_row = true;
     bool first_data = true;
     char *saveptr = NULL;
     char *line = strtok_r(buf, "\n", &saveptr);
@@ -169,19 +173,10 @@ static char *csv_to_json(const char *csv, int csv_len)
         if (ll > 0 && line[ll - 1] == '\r') line[--ll] = '\0';
         if (ll == 0) { line = strtok_r(NULL, "\n", &saveptr); continue; }
 
-        // Skip header
-        if (first_row) {
-            first_row = false;
-            if (strncmp(line, "timestamp", 9) == 0) {
-                line = strtok_r(NULL, "\n", &saveptr);
-                continue;
-            }
-        }
-
-        // Parse the 7 fields
-        char f[7][64] = {{0}};
+        // Parse the 9 fields: timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z,device_mac
+        char f[9][64] = {{0}};
         char *p = line;
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 9; i++) {
             char *comma = strchr(p, ',');
             size_t flen;
             if (comma) {
@@ -196,8 +191,14 @@ static char *csv_to_json(const char *csv, int csv_len)
             if (comma) p = comma + 1; else break;
         }
 
+        // Skip rows that don't start with a digit — guards against old header
+        // rows or any other non-data lines that may exist on the SD card.
+        if (f[0][0] < '0' || f[0][0] > '9') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+        // Skip rows with an empty device_mac
+        if (f[8][0] == '\0') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
         // Guard against buffer overrun
-        if (out + 160 >= end) {
+        if (out + 220 >= end) {
             ESP_LOGW(TAG, "JSON buffer full, truncating upload");
             break;
         }
@@ -205,12 +206,13 @@ static char *csv_to_json(const char *csv, int csv_len)
         if (!first_data) *out++ = ',';
         first_data = false;
 
-        // timestamp is an integer; lat/lon/accel_* are floats; mac is a string
+        // timestamp is an integer; lat/lon/alt/speed/accel_* are floats; mac is a string
         out += snprintf(out, (size_t)(end - out),
                         "{\"timestamp\":%s,\"lat\":%s,\"lon\":%s,"
+                        "\"alt\":%s,\"speed\":%s,"
                         "\"accel_x\":%s,\"accel_y\":%s,\"accel_z\":%s,"
                         "\"device_mac\":\"%s\"}",
-                        f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+                        f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
 
         line = strtok_r(NULL, "\n", &saveptr);
     }
@@ -226,6 +228,31 @@ static char *csv_to_json(const char *csv, int csv_len)
     *out++ = ']';
     *out   = '\0';
     return json;
+}
+
+// ─── HTTP event handler — captures response body ──────────────────────────────
+
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} resp_ctx_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    resp_ctx_t *ctx = (resp_ctx_t *)evt->user_data;
+    if (!ctx) return ESP_OK;
+
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        size_t remaining = ctx->cap - ctx->len - 1;
+        size_t copy = (size_t)evt->data_len < remaining ? (size_t)evt->data_len : remaining;
+        memcpy(ctx->buf + ctx->len, evt->data, copy);
+        ctx->len += copy;
+        ctx->buf[ctx->len] = '\0';
+    } else if (evt->event_id == HTTP_EVENT_ON_FINISH) {
+        ctx->len = 0; // reset between redirects
+    }
+    return ESP_OK;
 }
 
 // ─── Generic file upload ──────────────────────────────────────────────────────
@@ -254,18 +281,21 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     }
 
     ESP_LOGI(TAG, "%s: uploading %d bytes of JSON", label, (int)strlen(json));
+    ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
 
-    const size_t RESP_BUF = 512;
+    const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
     if (!resp_buf) { free(json); return false; }
 
+    resp_ctx_t resp_ctx = { .buf = resp_buf, .len = 0, .cap = RESP_BUF };
+
     esp_http_client_config_t http_cfg = {
-        .url                         = UPLOAD_URL,
-        .method                      = HTTP_METHOD_POST,
-        .timeout_ms                  = 3000,
-        .skip_cert_common_name_check = true,
-        .crt_bundle_attach           = NULL,
-        .use_global_ca_store         = false,
+        .url               = UPLOAD_URL,
+        .method            = HTTP_METHOD_POST,
+        .timeout_ms        = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = http_event_handler,
+        .user_data         = &resp_ctx,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -275,16 +305,12 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     esp_err_t err = esp_http_client_perform(client);
     bool ok = false;
     if (err == ESP_OK) {
-        int status  = esp_http_client_get_status_code(client);
-        int rlen    = esp_http_client_read_response(client, resp_buf, (int)(RESP_BUF - 1));
-        if (rlen > 0) resp_buf[rlen] = '\0';
-        ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
-        if ((status == 200 || status == 201) &&
-            (strstr(resp_buf, "\"success\":true") ||
-             strstr(resp_buf, "\"success\": true"))) {
+        int status = esp_http_client_get_status_code(client);
+        if (status >= 200 && status < 300) {
+            ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
             ok = true;
         } else {
-            ESP_LOGW(TAG, "%s: rejected by server (status=%d)", label, status);
+            ESP_LOGW(TAG, "%s: rejected by server (status=%d): %s", label, status, resp_buf);
         }
     } else {
         ESP_LOGE(TAG, "%s: HTTP error: %s", label, esp_err_to_name(err));

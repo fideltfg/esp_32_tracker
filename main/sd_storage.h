@@ -9,7 +9,7 @@
  *
  * All paths assume the SD card is mounted at SD_MOUNT_POINT (see config.h).
  * The CSV schema is:
- *   timestamp,lat,lon,accel_x,accel_y,accel_z,device_mac
+ *   timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z,device_mac
  */
 
 /**
