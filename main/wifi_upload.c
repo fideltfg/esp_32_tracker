@@ -37,10 +37,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         if (s_retry_count < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_retry_count++;
-            ESP_LOGI(TAG, "Retry %d/%d ...", s_retry_count, WIFI_MAX_RETRY);
+           // ESP_LOGI(TAG, "Retry %d/%d ...", s_retry_count, WIFI_MAX_RETRY);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGW(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
+            //ESP_LOGW(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -89,8 +89,7 @@ void wifi_stack_init(void)
     // driver directly via esp_wifi_sta_get_ap_info(), so no event group is needed.
 
     s_initialized = true;
-    ESP_LOGI(TAG, "WiFi upload module ready (driver %s)",
-             wifi_already_up ? "shared" : "owned");
+    //ESP_LOGI(TAG, "WiFi upload module ready (driver %s)", wifi_already_up ? "shared" : "owned");
 }
 
 bool wifi_connect(void)
@@ -121,7 +120,7 @@ void wifi_disconnect(void)
 {
     esp_wifi_disconnect();
     // esp_wifi_stop() is called by the state machine after espnow_deinit()
-    ESP_LOGI(TAG, "WiFi disconnected");
+   // ESP_LOGI(TAG, "WiFi disconnected");
 }
 
 bool wifi_is_connected(void)
@@ -199,7 +198,7 @@ static char *csv_to_json(const char *csv, int csv_len)
 
         // Guard against buffer overrun
         if (out + 220 >= end) {
-            ESP_LOGW(TAG, "JSON buffer full, truncating upload");
+           // ESP_LOGW(TAG, "JSON buffer full, truncating upload");
             break;
         }
 
@@ -262,13 +261,13 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     const size_t READ_BUF = 32 * 1024;
     char *csv_buf = malloc(READ_BUF);
     if (!csv_buf) {
-        ESP_LOGE(TAG, "OOM allocating read buffer");
+       // ESP_LOGE(TAG, "OOM allocating read buffer");
         return false;
     }
 
     int csv_len = reader(csv_buf, READ_BUF);
     if (csv_len <= 0) {
-        ESP_LOGI(TAG, "%s: nothing to upload", label);
+        //ESP_LOGI(TAG, "%s: nothing to upload", label);
         free(csv_buf);
         return true; // nothing to do is not a failure
     }
@@ -276,12 +275,12 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     char *json = csv_to_json(csv_buf, csv_len);
     free(csv_buf);
     if (!json) {
-        ESP_LOGI(TAG, "%s: no data rows after CSV\u2192JSON conversion", label);
+        //ESP_LOGI(TAG, "%s: no data rows after CSV\u2192JSON conversion", label);
         return true;
     }
 
     ESP_LOGI(TAG, "%s: uploading %d bytes of JSON", label, (int)strlen(json));
-    ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
+   // ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
 
     const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
@@ -307,7 +306,7 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
-            ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
+           // ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
             ok = true;
         } else {
             ESP_LOGW(TAG, "%s: rejected by server (status=%d): %s", label, status, resp_buf);

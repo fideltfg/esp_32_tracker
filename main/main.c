@@ -373,7 +373,7 @@ static esp_err_t lcd_init(void)
             if (ret == ESP_OK) {
                 lcd_actual_addr = addresses[i];
                 found = true;
-                ESP_LOGI(TAG, "LCD1602A found at address 0x%02X", addresses[i]);
+               // ESP_LOGI(TAG, "LCD1602A found at address 0x%02X", addresses[i]);
             }
             break;
         }
@@ -1411,10 +1411,10 @@ static void gps_logging_task(void *pvParameters)
             }
             
             if (log_to_csv(&log_gps, &imu_data) == ESP_OK) {
-                ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
-                         log_gps.latitude, log_gps.longitude,
-                         log_gps.altitude, log_gps.speed,
-                         imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                // ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
+                //          log_gps.latitude, log_gps.longitude,
+                //          log_gps.altitude, log_gps.speed,
+                //          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
             }
             
             // Update LCD with GPS data (now fast with dedicated bus!)

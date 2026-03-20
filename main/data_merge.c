@@ -86,7 +86,7 @@ int data_merge_from_file(const char *incoming_path, const char *skip_mac)
     MacTracker trackers[MAX_TRACKED_MACS];
     int        tracker_count = 0;
     load_max_timestamps(CSV_MERGED_FILE, trackers, &tracker_count, MAX_TRACKED_MACS);
-    ESP_LOGI(TAG, "Loaded HWM for %d device MAC(s)", tracker_count);
+   // ESP_LOGI(TAG, "Loaded HWM for %d device MAC(s)", tracker_count);
 
     FILE *in = fopen(incoming_path, "r");
     if (!in) {
