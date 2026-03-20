@@ -23,6 +23,7 @@ This project is in active development and in the final stages of prototyping bef
 - **WiFi Connectivity**: Automatic time synchronisation via NTP and periodic CSV upload to a server
 - **ESP-NOW Peer Sync**: When stationary, discovers nearby devices and exchanges CSV data bidirectionally
 - **Motion Detection**: GPS speed and IMU data used together to determine stationary state before syncing
+- **Progressive Power Management**: Multi-stage power saving that reduces logging frequency and disables WiFi uploads when devices are stationary for extended periods, while maintaining ESP-NOW peer sync capability
 
 
 ## Hardware
@@ -214,6 +215,27 @@ When the device is determined to be stationary (GPS speed below 2 km/h and IMU c
 4. Periodically uploads both `sync_data.csv` and `sync_merged.csv` to `UPLOAD_URL` via HTTP POST
 5. On successful upload, the files truncated.
 6. When the device starts moving, the sync loop exits and waits for the next stationary period
+
+### Power Management
+
+The system implements progressive power management to conserve battery and reduce SD card wear when devices are stationary for extended periods. The logging rate and upload behavior automatically adjust based on how long the device has been still:
+
+**Power States:**
+
+| State | Stationary Time | Log Interval | WiFi Uploads | ESP-NOW Sync |
+|-------|----------------|--------------|--------------|--------------|
+| **Moving** | 0-3 minutes | 1 second | Enabled | Active |
+| **Stage 1** | 3-5 minutes | 1 minute | Enabled | Active |
+| **Stage 2 (Low Power)** | 5+ minutes | 5 minutes | Disabled | Active |
+
+**Behavior:**
+- Motion detection uses GPS speed (<2 km/h) and IMU data (accelerometer/gyroscope thresholds)
+- When motion is detected at any stage, the system immediately returns to full speed logging and uploads
+- WiFi power save mode (WIFI_PS_MIN_MODEM) is active in all states to conserve power while maintaining ESP-NOW compatibility
+- In Stage 2 (low power), WiFi uploads are disabled to save power, but ESP-NOW peer sync remains fully operational
+- All thresholds are configurable in `sync_config.h` (`LOG_INTERVAL_*`, `STATIC_STAGE*_THRESHOLD_MS`)
+
+This approach ensures high-resolution tracking when moving while dramatically reducing power consumption and SD card wear when parked, all while maintaining the ability to sync with passing devices via ESP-NOW.
 
 ### LCD Display Modes
 

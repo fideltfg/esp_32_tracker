@@ -68,11 +68,38 @@
 #define CSV_DATA_FILE    SD_MOUNT_POINT "/sync_data.csv"
 #define CSV_MERGED_FILE  SD_MOUNT_POINT "/sync_merged.csv"
 #define CSV_MERGE_TMP    SD_MOUNT_POINT "/sync_tmp.csv"
+#define CONNECTIONS_LOG_FILE  SD_MOUNT_POINT "/connections.csv"
+
+// CSV column layout for records exchanged via ESP-NOW.
+// The tracker's log_to_csv() writes a matching row to CSV_DATA_FILE so that
+// own GPS records are included in peer exchanges.
+#define CSV_HEADER  "timestamp,lat,lon,alt,speed,accel_x,accel_y,accel_z,device_mac\n"
+
+// ─── Logging parameters ──────────────────────────────────────────────────────
+// Progressive power management: logging and uploads are reduced in stages as 
+// the device remains stationary to conserve battery and SD card wear.
+//
+// Power States (based on continuous stationary time):
+//   Moving (0-3 mins):    1s logging,  WiFi uploads enabled,  normal power
+//   Stage 1 (3-5 mins):   1min logging, WiFi uploads enabled,  normal power
+//   Stage 2 (5+ mins):    5min logging, WiFi uploads DISABLED, low power mode
+//
+// Motion detection uses GPS speed + IMU (accelerometer/gyroscope) data.
+// Any motion immediately restores full logging and uploads.
+// ESP-NOW peer sync remains active in all power states.
+//
+#define LOG_INTERVAL_MOVING_MS      1000   // Fast logging when moving (1 second)
+#define LOG_INTERVAL_STAGE1_MS     60000   // Stage 1: Static 3+ mins (1 minute)
+#define LOG_INTERVAL_STAGE2_MS    300000   // Stage 2: Static 5+ mins, low power (5 minutes)
+
+#define STATIC_STAGE1_THRESHOLD_MS 180000  // 3 minutes static -> Stage 1
+#define STATIC_STAGE2_THRESHOLD_MS 300000  // 5 minutes static -> Stage 2 (low power)
 
 // ─── Motion detection thresholds ─────────────────────────────────────────────
 #define GPS_STATIC_SPEED_KMH  2.0f    // km/h  — below this = stationary
 #define IMU_ACCEL_DEVIATION   0.15f   // g     — deviation from 1 g = stationary
 #define IMU_GYRO_STATIC_DPS   5.0f    // deg/s — below this = stationary
+#define GPS_EMA_ALPHA         0.3f    // Exponential moving average alpha for GPS smoothing
 
 // ─── ESP-NOW protocol parameters ─────────────────────────────────────────────
 #define ESPNOW_BROADCAST_MAC    { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }

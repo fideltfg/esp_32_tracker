@@ -279,8 +279,8 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
         return true;
     }
 
-    ESP_LOGI(TAG, "%s: uploading %d bytes of JSON", label, (int)strlen(json));
-   // ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
+    ESP_LOGI(TAG, "%s: uploading %d bytes of JSON to %s", label, (int)strlen(json), UPLOAD_URL);
+    ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
 
     const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
@@ -288,15 +288,26 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
 
     resp_ctx_t resp_ctx = { .buf = resp_buf, .len = 0, .cap = RESP_BUF };
 
+    // Configure HTTP client - only use TLS for HTTPS URLs
+    bool is_https = (strncmp(UPLOAD_URL, "https://", 8) == 0);
+    
     esp_http_client_config_t http_cfg = {
         .url               = UPLOAD_URL,
         .method            = HTTP_METHOD_POST,
         .timeout_ms        = 10000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = is_https ? esp_crt_bundle_attach : NULL,
         .event_handler     = http_event_handler,
         .user_data         = &resp_ctx,
     };
+    
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "%s: Failed to initialize HTTP client", label);
+        free(json);
+        free(resp_buf);
+        return false;
+    }
+    
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Accept",       "application/json");
     esp_http_client_set_post_field(client, json, (int)strlen(json));
@@ -306,7 +317,7 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
-           // ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
+            ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
             ok = true;
         } else {
             ESP_LOGW(TAG, "%s: rejected by server (status=%d): %s", label, status, resp_buf);
@@ -315,9 +326,15 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
         ESP_LOGE(TAG, "%s: HTTP error: %s", label, esp_err_to_name(err));
     }
 
+    // Explicitly close connection before cleanup
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
     free(json);
     free(resp_buf);
+    
+    // Give the TCP stack time to release the socket
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     return ok;
 }
 
@@ -338,6 +355,10 @@ bool wifi_upload_all_csv(void)
         ESP_LOGW(TAG, "Own data upload failed – skipping peer upload");
         return false;
     }
+    
+    // Brief delay between uploads to ensure socket is fully released
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
     bool merged_ok = wifi_upload_merged_csv();
     (void)merged_ok; // peer upload failure is non-fatal
     return own_ok;
