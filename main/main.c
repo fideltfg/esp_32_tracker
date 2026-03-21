@@ -68,6 +68,8 @@ typedef struct {
     float longitude;
     float altitude;
     float speed;
+    float hdop;    // horizontal dilution of precision (from GPGGA)
+    int   num_sv;  // satellites in use (from GPGGA)
     bool valid;
 } gps_data_t;
 
@@ -897,24 +899,36 @@ static bool parse_gprmc(const char *nmea, gps_data_t *gps_data)
 
 static bool parse_gpgga(const char *nmea, gps_data_t *gps_data)
 {
-    // $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
+    // $GPGGA,HHMMSS,Lat,N/S,Lon,E/W,FS,NoSV,HDOP,AltMSL,M,...
+    //   FS   = fix status (0=invalid, 1=GPS, 2=DGPS/SBAS)
+    //   NoSV = satellites in use
+    //   HDOP = horizontal dilution of precision
     char *token;
     char nmea_copy[128];
     strncpy(nmea_copy, nmea, sizeof(nmea_copy) - 1);
-    
+    nmea_copy[sizeof(nmea_copy) - 1] = '\0';
+
     token = strtok(nmea_copy, ",");
     if (!token || strcmp(token, "$GPGGA") != 0) return false;
-    
-    // Skip to altitude (9th field)
-    for (int i = 0; i < 8; i++) {
-        token = strtok(NULL, ",");
-    }
-    
-    token = strtok(NULL, ","); // Altitude
-    if (token) {
-        gps_data->altitude = atof(token);
-    }
-    
+
+    token = strtok(NULL, ","); // Time
+    token = strtok(NULL, ","); // Latitude (skip — already in RMC)
+    token = strtok(NULL, ","); // N/S
+    token = strtok(NULL, ","); // Longitude (skip)
+    token = strtok(NULL, ","); // E/W
+
+    token = strtok(NULL, ","); // Fix status
+    if (!token || token[0] == '0') return false; // no fix
+
+    token = strtok(NULL, ","); // Number of satellites
+    if (token) gps_data->num_sv = atoi(token);
+
+    token = strtok(NULL, ","); // HDOP
+    if (token) gps_data->hdop = atof(token);
+
+    token = strtok(NULL, ","); // Altitude (MSL)
+    if (token) gps_data->altitude = atof(token);
+
     return true;
 }
 
@@ -1081,6 +1095,71 @@ static void gps_configure_5hz(void)
         ESP_LOGI(TAG, "NEO-6M: 5 Hz rate set (ACK-ACK)");
     } else {
         ESP_LOGE(TAG, "NEO-6M: 5 Hz rate set failed (ACK-NAK or timeout)");
+    }
+
+    // ── Navigation engine: pedestrian model + static hold ────────────────────
+    // CFG-NAV5 (0x06 0x24), 36-byte payload.
+    // mask = 0x0041: apply dynModel (bit 0) and staticHoldThresh (bit 6) only.
+    // dynModel = 3 (pedestrian) improves stationary accuracy vs. the default
+    //   portable (0) model by tightening the receiver's motion model.
+    // staticHoldThresh = GPS_STATIC_HOLD_CM_S: below this speed the receiver
+    //   freezes its reported position to suppress multipath wander.
+    uint8_t nav5_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x24,              // CFG-NAV5
+        0x24, 0x00,              // payload length = 36
+        0x41, 0x00,              // mask = 0x0041 (dynModel + staticHold)
+        0x03,                    // dynModel = 3 (pedestrian)
+        0x02,                    // fixMode  = 2 (not applied by mask)
+        0x00, 0x00, 0x00, 0x00,  // fixedAlt
+        0x10, 0x27, 0x00, 0x00,  // fixedAltVar
+        0x05,                    // minElev  = 5°
+        0x00,                    // drLimit
+        0xFA, 0x00,              // pDop = 25.0
+        0xFA, 0x00,              // tDop = 25.0
+        0x64, 0x00,              // pAcc = 100 m
+        0x2C, 0x01,              // tAcc = 300 m
+        GPS_STATIC_HOLD_CM_S,    // staticHoldThresh (cm/s)
+        0x00,                    // dgpsTimeOut
+        0x00, 0x00, 0x00, 0x00,  // reserved2
+        0x00, 0x00, 0x00, 0x00,  // reserved3
+        0x00, 0x00, 0x00, 0x00,  // reserved4
+        0x00, 0x00               // CK_A, CK_B
+    };
+    ubx_send(nav5_msg, sizeof(nav5_msg));
+    if (ubx_wait_ack(0x06, 0x24)) {
+        ESP_LOGI(TAG, "NEO-6M: pedestrian model + static hold set (ACK-ACK)");
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: CFG-NAV5 failed (ACK-NAK or timeout)");
+    }
+
+    // ── SBAS (WAAS / EGNOS / MSAS / GAGAN) ───────────────────────────────────
+    // CFG-SBAS (0x06 0x16), 8-byte payload.
+    // mode  = 0x07: enable + ranging + differential corrections
+    // usage = 0x03: use SBAS for ranging and differential corrections
+    // scanmode1 = 0: auto-detect all available SBAS PRNs
+    uint8_t sbas_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x16,              // CFG-SBAS
+        0x08, 0x00,              // payload length = 8
+        0x07,                    // mode: enable + ranging + correction
+        0x03,                    // usage: ranging + diffCorr
+        0x03,                    // maxSBAS = 3 channels
+        0x00,                    // scanmode2
+        // scanmode1: PRN bitmask derived from GPS_SBAS_REGION in sync_config.h.
+        // Bit N = PRN (120+N).  0x00000000 = auto-scan all.
+        (uint8_t)((GPS_SBAS_REGION)        & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >>  8)  & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >> 16)  & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >> 24)  & 0xFF),
+        0x00, 0x00               // CK_A, CK_B
+    };
+    ubx_send(sbas_msg, sizeof(sbas_msg));
+    if (ubx_wait_ack(0x06, 0x16)) {
+        ESP_LOGI(TAG, "NEO-6M: SBAS enabled, region mask=0x%08lX (ACK-ACK)",
+                 (unsigned long)GPS_SBAS_REGION);
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: SBAS enable failed (ACK-NAK or timeout)");
     }
 }
 
@@ -1562,37 +1641,49 @@ static void gps_logging_task(void *pvParameters)
         // log interval.  imu_static_last is kept current by the log-tick block.
         if (gps_fix_updated && gps_data.valid) {
             gps_fix_updated = false;
-            if (!ema_initialized) {
-                ema_lat       = gps_data.latitude;
-                ema_lon       = gps_data.longitude;
-                ema_alt       = gps_data.altitude;
-                ema_initialized = true;
-            } else if (imu_static_last) {
-                double dlat    = gps_data.latitude  - ema_lat;
-                double dlon    = gps_data.longitude - ema_lon;
-                double cos_lat = cos(ema_lat * M_PI / 180.0);
-                double dist_m  = sqrt((dlat * dlat + dlon * dlon * cos_lat * cos_lat)
-                                      * 111120.0 * 111120.0);
-                if (dist_m < GPS_OUTLIER_REJECT_M) {
-                    ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0 - GPS_EMA_ALPHA) * ema_lat;
-                    ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0 - GPS_EMA_ALPHA) * ema_lon;
-                    ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
-                } else {
-                    ESP_LOGD(TAG, "GPS outlier rejected: %.1f m from EMA", (float)dist_m);
-                }
+
+            // Fix quality gate: skip fixes with poor geometry or too few SVs.
+            // Both conditions must be checked together so a bad HDOP fix cannot
+            // pollute the EMA even when the outlier distance check would pass.
+            if (gps_data.hdop > GPS_MAX_HDOP || gps_data.num_sv < GPS_MIN_SV) {
+                ESP_LOGD(TAG, "GPS fix skipped: HDOP=%.1f SVs=%d",
+                         gps_data.hdop, gps_data.num_sv);
             } else {
-                // Moving — snap filter to raw position so tracking stays responsive
-                ema_lat = gps_data.latitude;
-                ema_lon = gps_data.longitude;
-                ema_alt = gps_data.altitude;
-            }
-            // Keep log_gps current at GPS rate so the log-tick always has the
-            // freshest filtered position ready to write.
-            log_gps = gps_data;
-            if (imu_static_last) {
-                log_gps.latitude  = (float)ema_lat;
-                log_gps.longitude = (float)ema_lon;
-                log_gps.altitude  = ema_alt;
+                // ── EMA filter ────────────────────────────────────────────────
+                if (!ema_initialized) {
+                    ema_lat       = gps_data.latitude;
+                    ema_lon       = gps_data.longitude;
+                    ema_alt       = gps_data.altitude;
+                    ema_initialized = true;
+                } else if (imu_static_last) {
+                    double dlat    = gps_data.latitude  - ema_lat;
+                    double dlon    = gps_data.longitude - ema_lon;
+                    double cos_lat = cos(ema_lat * M_PI / 180.0);
+                    double dist_m  = sqrt((dlat * dlat + dlon * dlon * cos_lat * cos_lat)
+                                          * 111120.0 * 111120.0);
+                    if (dist_m < GPS_OUTLIER_REJECT_M) {
+                        ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0 - GPS_EMA_ALPHA) * ema_lat;
+                        ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0 - GPS_EMA_ALPHA) * ema_lon;
+                        ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
+                    } else {
+                        ESP_LOGD(TAG, "GPS outlier rejected: %.1f m from EMA", (float)dist_m);
+                    }
+                } else {
+                    // Moving — snap filter to raw position so tracking stays responsive
+                    ema_lat = gps_data.latitude;
+                    ema_lon = gps_data.longitude;
+                    ema_alt = gps_data.altitude;
+                }
+
+                // Keep log_gps current at GPS rate so the log-tick always has
+                // the freshest filtered position ready to write.  Bad-quality
+                // fixes do not update log_gps so the last good position persists.
+                log_gps = gps_data;
+                if (imu_static_last) {
+                    log_gps.latitude  = (float)ema_lat;
+                    log_gps.longitude = (float)ema_lon;
+                    log_gps.altitude  = ema_alt;
+                }
             }
         }
 
