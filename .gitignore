@@ -83,3 +83,4 @@ Desktop.ini
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
 main/sync_config.h
+build_output.txt

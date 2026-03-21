@@ -938,6 +938,152 @@ static void gps_uart_init(void)
     ESP_LOGI(TAG, "GPS UART initialized");
 }
 
+// Compute the Fletcher-8 checksum used by all UBX packets.
+// The checksum covers every byte from the Class field up to (but not
+// including) the two checksum bytes at the end of the message.
+static void ubx_checksum(const uint8_t *data, size_t len,
+                          uint8_t *ck_a, uint8_t *ck_b)
+{
+    *ck_a = 0;
+    *ck_b = 0;
+    for (size_t i = 0; i < len; i++) {
+        *ck_a = (uint8_t)(*ck_a + data[i]);
+        *ck_b = (uint8_t)(*ck_b + *ck_a);
+    }
+}
+
+// Send one UBX packet (sync chars + payload + checksum) over GPS_UART_NUM.
+static void ubx_send(uint8_t *msg, size_t len)
+{
+    // msg[] layout: 0xB5, 0x62, class, id, lenL, lenH, payload..., 0x00, 0x00
+    // Checksum covers bytes [2 .. len-3].
+    ubx_checksum(&msg[2], len - 4, &msg[len - 2], &msg[len - 1]);
+    uart_write_bytes(GPS_UART_NUM, (const char *)msg, (int)len);
+}
+
+// Wait for a UBX-ACK-ACK or UBX-ACK-NAK response to the command identified
+// by (ack_cls, ack_id).  Returns true on ACK-ACK, false on ACK-NAK or timeout.
+// The module may still be emitting NMEA before the ACK arrives so we scan the
+// raw byte stream for the UBX sync preamble rather than assuming clean framing.
+static bool ubx_wait_ack(uint8_t ack_cls, uint8_t ack_id)
+{
+    // UBX-ACK packet layout (10 bytes total):
+    //   B5 62  — sync
+    //   05 xx  — class 0x05, id 0x01=ACK-ACK / 0x00=ACK-NAK
+    //   02 00  — payload length = 2
+    //   cc ii  — clsID and msgID of the acknowledged message
+    //   CK_A CK_B
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(300);
+    uint8_t buf[1];
+    uint8_t state = 0; // simple byte-by-byte state machine
+
+    // Byte positions we care about while scanning:
+    //  state 0: looking for 0xB5
+    //  state 1: looking for 0x62
+    //  state 2: looking for class 0x05
+    //  state 3: ACK id byte (0x01 or 0x00)
+    //  state 4: payload len low  (must be 0x02)
+    //  state 5: payload len high (must be 0x00)
+    //  state 6: clsID of acked msg
+    //  state 7: msgID of acked msg
+    uint8_t ack_type = 0;
+
+    while (xTaskGetTickCount() < deadline) {
+        int n = uart_read_bytes(GPS_UART_NUM, buf, 1, pdMS_TO_TICKS(10));
+        if (n <= 0) continue;
+
+        switch (state) {
+            case 0: if (buf[0] == 0xB5) state = 1; break;
+            case 1: state = (buf[0] == 0x62) ? 2 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 2: state = (buf[0] == 0x05) ? 3 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 3:
+                if (buf[0] == 0x01 || buf[0] == 0x00) {
+                    ack_type = buf[0]; // 0x01 = ACK, 0x00 = NAK
+                    state = 4;
+                } else {
+                    state = (buf[0] == 0xB5) ? 1 : 0;
+                }
+                break;
+            case 4: state = (buf[0] == 0x02) ? 5 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 5: state = (buf[0] == 0x00) ? 6 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 6:
+                if (buf[0] == ack_cls) { state = 7; }
+                else                   { state = (buf[0] == 0xB5) ? 1 : 0; }
+                break;
+            case 7:
+                if (buf[0] == ack_id) {
+                    return (ack_type == 0x01); // true = ACK-ACK
+                }
+                state = (buf[0] == 0xB5) ? 1 : 0;
+                break;
+            default: state = 0; break;
+        }
+    }
+    return false; // timeout
+}
+
+// Configure the NEO-6M for 5 Hz updates and disable the NMEA sentences that
+// the parser never reads (GLL, GSA, GSV, VTG).  Only GGA and RMC are kept,
+// which keeps the UART load comfortably within 9600 baud at 5 Hz.
+//
+// Changes take effect immediately but are lost on power-cycle unless the
+// module has battery-backed RAM and a CFG-CFG save is sent.
+static void gps_configure_5hz(void)
+{
+    // A brief warm-up delay lets the module finish its startup NMEA burst
+    // before we send UBX config, reducing the chance of a NACK.
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // ── Disable unneeded NMEA sentences ──────────────────────────────────────
+    // UBX-CFG-MSG (3-byte payload): msgClass, msgId, rate
+    //   rate = 0  → disabled on all ports
+    //   rate = 1  → enabled  on all ports
+    // Sentences we turn off: GLL (F0 01), GSA (F0 02), GSV (F0 03), VTG (F0 05)
+    static const struct { uint8_t cls; uint8_t id; const char *name; } disable[] = {
+        { 0xF0, 0x01, "GLL" },
+        { 0xF0, 0x02, "GSA" },
+        { 0xF0, 0x03, "GSV" },
+        { 0xF0, 0x05, "VTG" },
+    };
+    for (int i = 0; i < (int)(sizeof(disable) / sizeof(disable[0])); i++) {
+        uint8_t msg[] = {
+            0xB5, 0x62,                       // UBX sync
+            0x06, 0x01,                       // CFG-MSG
+            0x03, 0x00,                       // payload length = 3
+            disable[i].cls, disable[i].id,    // sentence class / id
+            0x00,                             // rate = 0 (disabled)
+            0x00, 0x00                        // CK_A, CK_B (filled by ubx_send)
+        };
+        ubx_send(msg, sizeof(msg));
+        if (ubx_wait_ack(0x06, 0x01)) {
+            ESP_LOGI(TAG, "NEO-6M: disabled %s (ACK-ACK)", disable[i].name);
+        } else {
+            ESP_LOGE(TAG, "NEO-6M: disable %s failed (ACK-NAK or timeout)", disable[i].name);
+        }
+    }
+
+    // ── Set 5 Hz navigation update rate ──────────────────────────────────────
+    // UBX-CFG-RATE payload:
+    //   measRate = 200 ms (0x00C8) — measurement period
+    //   navRate  = 1      (0x0001) — navigation cycles per measurement
+    //   timeRef  = 1      (0x0001) — GPS time reference
+    uint8_t rate_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x08,              // CFG-RATE
+        0x06, 0x00,              // payload length = 6
+        0xC8, 0x00,              // measRate = 200 ms
+        0x01, 0x00,              // navRate  = 1
+        0x01, 0x00,              // timeRef  = 1 (GPS time)
+        0x00, 0x00               // CK_A, CK_B (filled by ubx_send)
+    };
+    ubx_send(rate_msg, sizeof(rate_msg));
+    if (ubx_wait_ack(0x06, 0x08)) {
+        ESP_LOGI(TAG, "NEO-6M: 5 Hz rate set (ACK-ACK)");
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: 5 Hz rate set failed (ACK-NAK or timeout)");
+    }
+}
+
 /* ==================== SD Card Functions ==================== */
 
 static esp_err_t sd_card_init(void)
@@ -988,7 +1134,7 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
     
     char row[128];
     snprintf(row, sizeof(row),
-             "%" PRId64 ",%.4f,%.4f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
+             "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
              (int64_t)time(NULL),
              gps_data->latitude,
              gps_data->longitude,
@@ -1317,18 +1463,33 @@ static void gps_logging_task(void *pvParameters)
     uint32_t lcd_resync_counter = 0;
 
     // EMA filter state — smooths GPS lat/lon/alt while the device is stationary
-    float ema_lat = 0.0f, ema_lon = 0.0f, ema_alt = 0.0f;
-    bool  ema_initialized = false;
-    
+    // double accumulators avoid float precision loss (~0.85 m/bit at mid-latitudes)
+    double ema_lat = 0.0, ema_lon = 0.0;
+    float  ema_alt = 0.0f;
+    bool   ema_initialized = false;
+
     // Adaptive logging interval state — reduces log rate when stationary
     uint32_t stationary_time_ms = 0;
     uint32_t current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
     bool was_stationary = false;
+
+    // Sub-second IMU accumulator — IMU is sampled at GPS_SAMPLE_PERIOD_MS and
+    // averaged over the full log interval for more stable motion detection.
+    float      imu_sum_ax = 0.0f, imu_sum_ay = 0.0f, imu_sum_az = 0.0f;
+    float      imu_sum_gx = 0.0f, imu_sum_gy = 0.0f, imu_sum_gz = 0.0f;
+    uint32_t   imu_sample_count = 0;
+    TickType_t last_log_tick = 0;
+    // Persistent filtered position — updated on each GPS fix, used for CSV / LCD
+    gps_data_t log_gps = {0};
+    // Track whether a new GPS fix arrived this loop iteration
+    bool gps_fix_updated = false;
+    // Last known IMU static state — computed at log rate but applied at GPS rate
+    bool imu_static_last = false;
     
     ESP_LOGI(TAG, "GPS logging task started");
     
     while (1) {
-        int len = uart_read_bytes(GPS_UART_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(GPS_UART_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(GPS_SAMPLE_PERIOD_MS));
         
         if (len > 0) {
             for (int i = 0; i < len; i++) {
@@ -1340,7 +1501,11 @@ static void gps_logging_task(void *pvParameters)
                         
                         // Parse NMEA sentences
                         if (strncmp(line_buffer, "$GPRMC", 6) == 0) {
+                            bool was_valid = gps_data.valid;
                             parse_gprmc(line_buffer, &gps_data);
+                            // A new valid fix has arrived when status flips to A
+                            if (gps_data.valid) gps_fix_updated = true;
+                            (void)was_valid;
                         } else if (strncmp(line_buffer, "$GPGGA", 6) == 0) {
                             parse_gpgga(line_buffer, &gps_data);
                         }
@@ -1357,6 +1522,17 @@ static void gps_logging_task(void *pvParameters)
         esp_err_t imu_ret = mpu6050_read_data(&imu_data);
         if (imu_ret != ESP_OK && imu_ret != ESP_ERR_INVALID_STATE) {
             ESP_LOGD(TAG, "Failed to read IMU data: %s", esp_err_to_name(imu_ret));
+        }
+
+        // Accumulate IMU at GPS_SAMPLE_PERIOD_MS rate for averaging over the log interval
+        if (imu_ret == ESP_OK) {
+            imu_sum_ax += imu_data.accel_x;
+            imu_sum_ay += imu_data.accel_y;
+            imu_sum_az += imu_data.accel_z;
+            imu_sum_gx += imu_data.gyro_x;
+            imu_sum_gy += imu_data.gyro_y;
+            imu_sum_gz += imu_data.gyro_z;
+            imu_sample_count++;
         }
 
         // Update shared motion state used by the ESP-NOW sync task
@@ -1380,25 +1556,93 @@ static void gps_logging_task(void *pvParameters)
         }
 #endif
 
+        // ── Per-fix EMA update (runs at GPS rate, up to 5 Hz) ────────────────
+        // Update the position filter on every new GPS fix so the EMA has the
+        // maximum number of samples to converge on, rather than only once per
+        // log interval.  imu_static_last is kept current by the log-tick block.
+        if (gps_fix_updated && gps_data.valid) {
+            gps_fix_updated = false;
+            if (!ema_initialized) {
+                ema_lat       = gps_data.latitude;
+                ema_lon       = gps_data.longitude;
+                ema_alt       = gps_data.altitude;
+                ema_initialized = true;
+            } else if (imu_static_last) {
+                double dlat    = gps_data.latitude  - ema_lat;
+                double dlon    = gps_data.longitude - ema_lon;
+                double cos_lat = cos(ema_lat * M_PI / 180.0);
+                double dist_m  = sqrt((dlat * dlat + dlon * dlon * cos_lat * cos_lat)
+                                      * 111120.0 * 111120.0);
+                if (dist_m < GPS_OUTLIER_REJECT_M) {
+                    ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0 - GPS_EMA_ALPHA) * ema_lat;
+                    ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0 - GPS_EMA_ALPHA) * ema_lon;
+                    ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
+                } else {
+                    ESP_LOGD(TAG, "GPS outlier rejected: %.1f m from EMA", (float)dist_m);
+                }
+            } else {
+                // Moving — snap filter to raw position so tracking stays responsive
+                ema_lat = gps_data.latitude;
+                ema_lon = gps_data.longitude;
+                ema_alt = gps_data.altitude;
+            }
+            // Keep log_gps current at GPS rate so the log-tick always has the
+            // freshest filtered position ready to write.
+            log_gps = gps_data;
+            if (imu_static_last) {
+                log_gps.latitude  = (float)ema_lat;
+                log_gps.longitude = (float)ema_lon;
+                log_gps.altitude  = ema_alt;
+            }
+        }
+
+        // ── Log tick gate ─────────────────────────────────────────────────────
+        // The loop runs at GPS_SAMPLE_PERIOD_MS so the IMU is sampled at ~10 Hz.
+        // The CSV write, EMA filter, and power management only fire when the
+        // log interval has elapsed.
+        {
+            TickType_t now_tick = xTaskGetTickCount();
+            if ((TickType_t)(now_tick - last_log_tick) < pdMS_TO_TICKS(current_log_interval_ms)) {
+                continue;
+            }
+            last_log_tick = now_tick;
+        }
+
+        // ── Average accumulated IMU samples for this log interval ─────────────
+        // Falls back to the most recent instant reading if no samples accumulated.
+        imu_data_t avg_imu = imu_data;
+        if (imu_sample_count > 0) {
+            avg_imu.accel_x = imu_sum_ax / (float)imu_sample_count;
+            avg_imu.accel_y = imu_sum_ay / (float)imu_sample_count;
+            avg_imu.accel_z = imu_sum_az / (float)imu_sample_count;
+            avg_imu.gyro_x  = imu_sum_gx / (float)imu_sample_count;
+            avg_imu.gyro_y  = imu_sum_gy / (float)imu_sample_count;
+            avg_imu.gyro_z  = imu_sum_gz / (float)imu_sample_count;
+            imu_sum_ax = imu_sum_ay = imu_sum_az = 0.0f;
+            imu_sum_gx = imu_sum_gy = imu_sum_gz = 0.0f;
+            imu_sample_count = 0;
+        }
+
         // ── GPS position jitter filter ────────────────────────────────────────
-        // The Neo-6M reports position noise of several meters even when still.
-        // When both IMU and GPS speed agree the device is stationary, apply an
-        // EMA to the logged coordinates so the track doesn't wander.
-        // When motion is detected we snap the filter to the raw position so the
-        // first logged point after moving is accurate.
-        gps_data_t log_gps = gps_data;  // filtered copy used for CSV / LCD
+        // The EMA is now updated at GPS rate (up to 5 Hz) in the per-fix block
+        // above.  Here we only (re-)compute imu_static so the per-fix block has
+        // an up-to-date gate value for the next batch of fixes.
         bool stationary = false;
-        
+
         if (gps_data.valid) {
-            float am = sqrtf(imu_data.accel_x * imu_data.accel_x +
-                             imu_data.accel_y * imu_data.accel_y +
-                             imu_data.accel_z * imu_data.accel_z);
-            float gm = sqrtf(imu_data.gyro_x  * imu_data.gyro_x  +
-                             imu_data.gyro_y  * imu_data.gyro_y  +
-                             imu_data.gyro_z  * imu_data.gyro_z);
+            float am = sqrtf(avg_imu.accel_x * avg_imu.accel_x +
+                             avg_imu.accel_y * avg_imu.accel_y +
+                             avg_imu.accel_z * avg_imu.accel_z);
+            float gm = sqrtf(avg_imu.gyro_x  * avg_imu.gyro_x  +
+                             avg_imu.gyro_y  * avg_imu.gyro_y  +
+                             avg_imu.gyro_z  * avg_imu.gyro_z);
             stationary = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
                          (gm < IMU_GYRO_STATIC_DPS) &&
                          (gps_data.speed < GPS_STATIC_SPEED_KMH);
+
+            // Update gate for the per-fix EMA block (IMU-only, see comment there)
+            imu_static_last = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
+                               (gm < IMU_GYRO_STATIC_DPS);
 
             // ── Progressive power management ──────────────────────────────────
             // Track stationary time and transition through power states:
@@ -1450,25 +1694,6 @@ static void gps_logging_task(void *pvParameters)
                 }
             }
             was_stationary = stationary;
-
-            if (!ema_initialized) {
-                ema_lat = gps_data.latitude;
-                ema_lon = gps_data.longitude;
-                ema_alt = gps_data.altitude;
-                ema_initialized = true;
-            } else if (stationary) {
-                ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0f - GPS_EMA_ALPHA) * ema_lat;
-                ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0f - GPS_EMA_ALPHA) * ema_lon;
-                ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
-                log_gps.latitude  = ema_lat;
-                log_gps.longitude = ema_lon;
-                log_gps.altitude  = ema_alt;
-            } else {
-                // Moving — snap filter to raw position so tracking stays responsive
-                ema_lat = gps_data.latitude;
-                ema_lon = gps_data.longitude;
-                ema_alt = gps_data.altitude;
-            }
         }
 
         // Log data if GPS is valid
@@ -1490,7 +1715,7 @@ static void gps_logging_task(void *pvParameters)
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             }
             
-            if (log_to_csv(&log_gps, &imu_data) == ESP_OK) {
+            if (log_to_csv(&log_gps, &avg_imu) == ESP_OK) {
                 // ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
                 //          log_gps.latitude, log_gps.longitude,
                 //          log_gps.altitude, log_gps.speed,
@@ -1522,11 +1747,11 @@ static void gps_logging_task(void *pvParameters)
         } else {
             // No GPS fix — log a local-only entry (fix=0) with available IMU data.
             // These rows are written to sync_data.csv but not streamed to peers.
-            if (log_to_csv(&log_gps, &imu_data) != ESP_OK) {
+            if (log_to_csv(&log_gps, &avg_imu) != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to write no-fix log entry");
             }
             ESP_LOGW(TAG, "Waiting for GPS fix... (accel: %.3f, %.3f, %.3f g)",
-                     imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                     avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
             
             // Update LCD showing "No GPS" and IMU data (now fast with dedicated bus!)
             if (lcd_initialized && lcd_display_on) {
@@ -1541,7 +1766,7 @@ static void gps_logging_task(void *pvParameters)
                     // GPS/IMU mode
                     lcd_printf(0, 0, "No GPS Fix");
                     lcd_printf(0, 1, "A:%.2f,%.2f,%.2f", 
-                              imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                              avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
                 } else {
                     // Time/IP mode
                     char date_str[17], time_str[17], ip_str[17];
@@ -1553,8 +1778,6 @@ static void gps_logging_task(void *pvParameters)
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(current_log_interval_ms));
-
         // Resync LCD every ~5 seconds to silently fix any nibble misalignment
         if (lcd_initialized && lcd_display_on) {
             lcd_resync_counter++;
@@ -1713,16 +1936,16 @@ static void sync_state_machine_task(void *pv)
                     
                     // Upload if we're now connected
                     if (wifi_is_connected()) {
-                        ESP_LOGI(TAG, "[%d] WiFi up \u2013 uploading sync files...", search_time);
+                        ESP_LOGI(TAG, "[%d] WiFi up – uploading sync files...", search_time);
                         if (wifi_upload_all_csv()) {
-                            ESP_LOGI(TAG, "Upload OK \u2013 resetting sync files");
-                            sd_delete_data_file();
-                            sd_ensure_data_file();
-                            sd_delete_merged_file();
-                            sd_ensure_merged_file();
+                            // wifi_upload_all_csv() now manages file lifecycle
+                            // internally (staging + delete on confirmed success).
+                            // Do NOT call sd_delete_data_file() here — it would
+                            // destroy records written since staging began.
+                            ESP_LOGI(TAG, "Upload OK");
                             espnow_sync_reset_peer_states();
                         } else {
-                            ESP_LOGW(TAG, "Upload failed \u2013 will retry");
+                            ESP_LOGW(TAG, "Upload failed – will retry");
                         }
                     }
                     
@@ -1862,8 +2085,9 @@ void app_main(void)
     sd_ensure_data_file();
     sd_ensure_merged_file();
     
-    // Initialize GPS UART
+    // Initialize GPS UART and configure module for 5 Hz
     gps_uart_init();
+    gps_configure_5hz();
     
     // Initialize WiFi
     wifi_init_sta();

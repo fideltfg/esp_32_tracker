@@ -105,3 +105,54 @@ int  sd_read_all(char *buf, size_t buf_size);
  * @return true on success.
  */
 bool sd_log_connection(const uint8_t *peer_mac, int records_rx, int records_tx);
+
+// ─── Upload staging helpers ───────────────────────────────────────────────────
+// These functions form the three-step safe-upload sequence:
+//   1. sd_stage_data_for_upload()   — atomically renames sync_data.csv to
+//                                     sync_upload.csv so the GPS task can
+//                                     continue writing to a fresh sync_data.csv
+//                                     while the upload is in progress.
+//   2. sd_read_chunk()              — reads the staged file page-by-page so
+//                                     arbitrarily large files are handled safely.
+//   3. sd_delete_upload_stage() /
+//      sd_delete_merge_stage()      — deletes the staged file only after the
+//                                     server has confirmed receipt (2xx).
+
+/**
+ * @brief Atomically stage the own-data file for upload.
+ *        If a previous staging file already exists (from a crashed upload),
+ *        any new data accumulated in CSV_DATA_FILE is appended to it first.
+ * @return true if there is data to upload (staging file exists and is non-empty).
+ */
+bool sd_stage_data_for_upload(void);
+
+/**
+ * @brief Atomically stage the merged-data file for upload (same logic as above).
+ * @return true if there is data to upload.
+ */
+bool sd_stage_merged_for_upload(void);
+
+/** @brief Delete CSV_UPLOAD_STAGE after a confirmed successful upload. */
+bool sd_delete_upload_stage(void);
+
+/** @brief Delete CSV_MERGE_STAGE after a confirmed successful upload. */
+bool sd_delete_merge_stage(void);
+
+/**
+ * @brief Read one page of complete CSV lines from a file.
+ *
+ * Reads up to buf_size-1 bytes starting at byte offset *offset, then
+ * truncates the result to the last complete line (i.e. the last '\n') so
+ * that no record is ever split across two calls.  On EOF the full remaining
+ * content is returned as-is.
+ *
+ * After a successful read *offset is advanced by the number of bytes
+ * returned so that the next call continues from where this one left off.
+ *
+ * @param path      Path of the file to read.
+ * @param buf       Destination buffer (must be at least buf_size bytes).
+ * @param buf_size  Size of the destination buffer (minimum 2).
+ * @param offset    In/out: byte offset to start reading from.
+ * @return  Bytes placed in buf (> 0), 0 at EOF, -1 on error.
+ */
+int sd_read_chunk(const char *path, char *buf, size_t buf_size, long *offset);

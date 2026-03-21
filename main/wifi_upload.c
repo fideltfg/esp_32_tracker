@@ -248,49 +248,28 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         memcpy(ctx->buf + ctx->len, evt->data, copy);
         ctx->len += copy;
         ctx->buf[ctx->len] = '\0';
-    } else if (evt->event_id == HTTP_EVENT_ON_FINISH) {
-        ctx->len = 0; // reset between redirects
+    } else if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
+        // Reset the response buffer at the start of each new connection
+        // (handles redirect chains correctly without clearing data we still need).
+        ctx->len = 0;
+        if (ctx->buf) ctx->buf[0] = '\0';
     }
     return ESP_OK;
 }
 
-// ─── Generic file upload ──────────────────────────────────────────────────────
+// ─── HTTP POST helper ─────────────────────────────────────────────────────────
+// POST a pre-built JSON string to UPLOAD_URL.  Returns true on HTTP 2xx.
 
-static bool upload_file(const char *label, int (*reader)(char *, size_t))
+static bool http_post_json(const char *label, const char *json)
 {
-    const size_t READ_BUF = 32 * 1024;
-    char *csv_buf = malloc(READ_BUF);
-    if (!csv_buf) {
-       // ESP_LOGE(TAG, "OOM allocating read buffer");
-        return false;
-    }
-
-    int csv_len = reader(csv_buf, READ_BUF);
-    if (csv_len <= 0) {
-        //ESP_LOGI(TAG, "%s: nothing to upload", label);
-        free(csv_buf);
-        return true; // nothing to do is not a failure
-    }
-
-    char *json = csv_to_json(csv_buf, csv_len);
-    free(csv_buf);
-    if (!json) {
-        //ESP_LOGI(TAG, "%s: no data rows after CSV\u2192JSON conversion", label);
-        return true;
-    }
-
-    ESP_LOGI(TAG, "%s: uploading %d bytes of JSON to %s", label, (int)strlen(json), UPLOAD_URL);
-    ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
-
     const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
-    if (!resp_buf) { free(json); return false; }
+    if (!resp_buf) return false;
 
     resp_ctx_t resp_ctx = { .buf = resp_buf, .len = 0, .cap = RESP_BUF };
 
-    // Configure HTTP client - only use TLS for HTTPS URLs
     bool is_https = (strncmp(UPLOAD_URL, "https://", 8) == 0);
-    
+
     esp_http_client_config_t http_cfg = {
         .url               = UPLOAD_URL,
         .method            = HTTP_METHOD_POST,
@@ -299,15 +278,14 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
         .event_handler     = http_event_handler,
         .user_data         = &resp_ctx,
     };
-    
+
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (!client) {
         ESP_LOGE(TAG, "%s: Failed to initialize HTTP client", label);
-        free(json);
         free(resp_buf);
         return false;
     }
-    
+
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Accept",       "application/json");
     esp_http_client_set_post_field(client, json, (int)strlen(json));
@@ -317,49 +295,134 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
-            ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
+            ESP_LOGI(TAG, "%s: HTTP %d — chunk accepted  %s", label, status, resp_buf);
             ok = true;
         } else {
-            ESP_LOGW(TAG, "%s: rejected by server (status=%d): %s", label, status, resp_buf);
+            ESP_LOGW(TAG, "%s: server rejected chunk (HTTP %d): %s", label, status, resp_buf);
         }
     } else {
         ESP_LOGE(TAG, "%s: HTTP error: %s", label, esp_err_to_name(err));
     }
 
-    // Explicitly close connection before cleanup
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    free(json);
     free(resp_buf);
-    
-    // Give the TCP stack time to release the socket
+
+    // Brief pause to let the TCP stack release the socket.
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     return ok;
 }
 
+// ─── Paged file upload ────────────────────────────────────────────────────────
+// Reads a staged file in 32 KB pages (aligned to complete CSV lines) and POSTs
+// each page as a separate JSON array.  Returns true only when every page has
+// been confirmed by the server; on any failure the staged file is left intact
+// so the next upload window can retry from the beginning.
+
+static bool upload_staged_file(const char *label, const char *filepath)
+{
+    const size_t READ_BUF = 32 * 1024;
+    char *csv_buf = malloc(READ_BUF);
+    if (!csv_buf) {
+        ESP_LOGE(TAG, "%s: OOM allocating read buffer", label);
+        return false;
+    }
+
+    long offset    = 0;
+    int  chunks_ok = 0;
+
+    while (true) {
+        int csv_len = sd_read_chunk(filepath, csv_buf, READ_BUF, &offset);
+        if (csv_len == 0) break;   // clean EOF — all pages sent
+        if (csv_len  < 0) {
+            ESP_LOGE(TAG, "%s: read error at offset %ld", label, offset);
+            free(csv_buf);
+            return false;
+        }
+
+        char *json = csv_to_json(csv_buf, csv_len);
+        if (!json) {
+            // No uploadable rows in this page (header-only chunk, etc.) — skip.
+            continue;
+        }
+
+        ESP_LOGI(TAG, "%s: uploading chunk %d (%d JSON bytes)",
+                 label, chunks_ok + 1, (int)strlen(json));
+
+        bool ok = http_post_json(label, json);
+        free(json);
+
+        if (!ok) {
+            // Staged file preserved — will be retried on next upload window.
+            free(csv_buf);
+            return false;
+        }
+
+        chunks_ok++;
+        vTaskDelay(pdMS_TO_TICKS(200)); // gap between chunks
+    }
+
+    free(csv_buf);
+
+    if (chunks_ok == 0) {
+        ESP_LOGI(TAG, "%s: file had no uploadable data rows", label);
+    }
+
+    return true; // all chunks confirmed (or file was empty)
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 bool wifi_upload_csv(void)
 {
-    return upload_file("own-data", sd_read_all);
+    if (!sd_stage_data_for_upload()) return true; // nothing to upload
+    sd_ensure_data_file(); // GPS task gets a fresh file immediately
+    bool ok = upload_staged_file("own-data", CSV_UPLOAD_STAGE);
+    if (ok) sd_delete_upload_stage();
+    return ok;
 }
 
 bool wifi_upload_merged_csv(void)
 {
-    return upload_file("peer-data", sd_read_merged);
+    if (!sd_stage_merged_for_upload()) return true;
+    sd_ensure_merged_file();
+    bool ok = upload_staged_file("peer-data", CSV_MERGE_STAGE);
+    if (ok) sd_delete_merge_stage();
+    return ok;
 }
 
 bool wifi_upload_all_csv(void)
 {
-    bool own_ok    = wifi_upload_csv();
-    if(!own_ok) {
-        ESP_LOGW(TAG, "Own data upload failed – skipping peer upload");
-        return false;
+    // ── Stage own data ────────────────────────────────────────────────────────
+    // Atomically rename sync_data.csv → sync_upload.csv so the GPS task can
+    // safely write to a new sync_data.csv while the upload is in progress.
+    bool own_staged = sd_stage_data_for_upload();
+    sd_ensure_data_file(); // create fresh file for GPS task right away
+
+    if (own_staged) {
+        bool own_ok = upload_staged_file("own-data", CSV_UPLOAD_STAGE);
+        if (!own_ok) {
+            ESP_LOGW(TAG, "Own data upload failed – staging file preserved for retry");
+            return false;
+        }
+        sd_delete_upload_stage();
     }
-    
-    // Brief delay between uploads to ensure socket is fully released
+
+    // ── Stage peer (merged) data ──────────────────────────────────────────────
     vTaskDelay(pdMS_TO_TICKS(200));
-    
-    bool merged_ok = wifi_upload_merged_csv();
-    (void)merged_ok; // peer upload failure is non-fatal
-    return own_ok;
+
+    bool merged_staged = sd_stage_merged_for_upload();
+    sd_ensure_merged_file();
+
+    if (merged_staged) {
+        bool merged_ok = upload_staged_file("peer-data", CSV_MERGE_STAGE);
+        if (merged_ok) {
+            sd_delete_merge_stage();
+        } else {
+            ESP_LOGW(TAG, "Peer data upload failed – staging file preserved for retry");
+            // Non-fatal: own data was already confirmed by the server.
+        }
+    }
+
+    return true; // own data uploaded (or there was none to send)
 }
