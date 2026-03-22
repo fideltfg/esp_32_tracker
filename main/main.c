@@ -92,7 +92,7 @@ static char g_own_mac_str[5] = {0}; // "AABB\0" – last 4 hex digits of WiFi MA
 typedef enum {
     POWER_STATE_MOVING = 0,  // Device moving: 1s logging, full uploads
     POWER_STATE_STAGE1 = 1,  // Static 3+ mins: 1min logging, full uploads
-    POWER_STATE_STAGE2 = 2,  // Static 5+ mins: 5min logging, NO uploads, low power
+    POWER_STATE_STAGE2 = 2,  // Static 5+ mins: 5min logging, periodic uploads (5min), low power
 } power_state_t;
 
 static volatile power_state_t g_power_state = POWER_STATE_MOVING;
@@ -1210,7 +1210,26 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
     if (!gps_valid || (gps_data->latitude == 0.0 && gps_data->longitude == 0.0)) {
         return ESP_OK; // Don't log invalid positions
     }
-    
+
+    // Skip duplicate positions: if lat, lon AND altitude are all identical to
+    // the last logged entry the device has not moved — no new information to store.
+    // Exception: always write a heartbeat entry at least once per minute so
+    // there is a continuous presence record even during long static periods.
+    static float   last_lat = 0.0f, last_lon = 0.0f, last_alt = 0.0f;
+    static int64_t last_write_ts = 0;
+    #define HEARTBEAT_INTERVAL_S  60
+    int64_t now_ts = (int64_t)time(NULL);
+    bool position_unchanged = (gps_data->latitude  == last_lat &&
+                               gps_data->longitude == last_lon &&
+                               gps_data->altitude  == last_alt);
+    bool heartbeat_due = (now_ts - last_write_ts) >= HEARTBEAT_INTERVAL_S;
+    if (position_unchanged && !heartbeat_due) {
+        return ESP_OK;
+    }
+
+    // Position unchanged → speed must be zero (GPS noise guard).
+    float logged_speed = position_unchanged ? 0.0f : gps_data->speed;
+
     char row[128];
     snprintf(row, sizeof(row),
              "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
@@ -1218,13 +1237,20 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
              gps_data->latitude,
              gps_data->longitude,
              gps_data->altitude,
-             gps_data->speed,
+             logged_speed,
              imu_data->accel_x,
              imu_data->accel_y,
              imu_data->accel_z,
              g_own_mac_str);
 
-    return sd_append_record(row) ? ESP_OK : ESP_FAIL;
+    if (!sd_append_record(row)) return ESP_FAIL;
+
+    // Only update the watermark after a successful write
+    last_lat = gps_data->latitude;
+    last_lon = gps_data->longitude;
+    last_alt = gps_data->altitude;
+    last_write_ts = now_ts;
+    return ESP_OK;
 }
 
 /* ==================== WiFi Functions ==================== */
@@ -1551,6 +1577,11 @@ static void gps_logging_task(void *pvParameters)
     uint32_t stationary_time_ms = 0;
     uint32_t current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
     bool was_stationary = false;
+    // Debounce for motion detection — require this many consecutive "moving" log
+    // ticks before resetting stationary_time_ms.  Prevents GPS speed noise spikes
+    // from restarting the 3-min / 5-min accumulation.
+    uint8_t  motion_confirm_count = 0;
+    #define MOTION_CONFIRM_TICKS  5   // ~5 s at 1 s log rate
 
     // Sub-second IMU accumulator — IMU is sampled at GPS_SAMPLE_PERIOD_MS and
     // averaged over the full log interval for more stable motion detection.
@@ -1564,6 +1595,19 @@ static void gps_logging_task(void *pvParameters)
     bool gps_fix_updated = false;
     // Last known IMU static state — computed at log rate but applied at GPS rate
     bool imu_static_last = false;
+    // Position lock — after GPS_POSITION_LOCK_TICKS consecutive static log-ticks
+    // the EMA position is frozen and all subsequent logged rows use it unchanged.
+    // This prevents long-term EMA drift during multi-hour stationary periods.
+    uint32_t static_lock_ticks = 0;
+    bool     position_locked   = false;
+    float    locked_lat_f      = 0.0f;
+    float    locked_lon_f      = 0.0f;
+    float    locked_alt_f      = 0.0f;
+    // Fast motion exit counter — ticks every GPS_SAMPLE_PERIOD_MS (200 ms).
+    // When Stage1 or Stage2 is active, movement is detected at full GPS rate
+    // without waiting for the slow log-tick.  MOTION_CONFIRM_TICKS consecutive
+    // moving samples = ~1 s at 200 ms/tick.
+    uint8_t fast_motion_ticks = 0;
     
     ESP_LOGI(TAG, "GPS logging task started");
     
@@ -1679,12 +1723,60 @@ static void gps_logging_task(void *pvParameters)
                 // the freshest filtered position ready to write.  Bad-quality
                 // fixes do not update log_gps so the last good position persists.
                 log_gps = gps_data;
-                if (imu_static_last) {
+                if (position_locked) {
+                    // Position lock active: freeze coordinates to the locked mean.
+                    log_gps.latitude  = locked_lat_f;
+                    log_gps.longitude = locked_lon_f;
+                    log_gps.altitude  = locked_alt_f;
+                } else if (imu_static_last) {
                     log_gps.latitude  = (float)ema_lat;
                     log_gps.longitude = (float)ema_lon;
                     log_gps.altitude  = ema_alt;
                 }
             }
+        }
+
+        // ── Fast motion detection (runs every GPS_SAMPLE_PERIOD_MS) ───────────
+        // When the device is in Stage1 or Stage2 the log tick fires too
+        // infrequently (1 min / 5 min) to detect movement quickly.  This block
+        // uses instantaneous IMU + GPS speed readings to exit the power-saving
+        // states immediately without waiting for the next slow log tick.
+        if (g_power_state != POWER_STATE_MOVING && gps_data.valid) {
+            float fam = sqrtf(imu_data.accel_x * imu_data.accel_x +
+                              imu_data.accel_y * imu_data.accel_y +
+                              imu_data.accel_z * imu_data.accel_z);
+            float fgm = sqrtf(imu_data.gyro_x  * imu_data.gyro_x  +
+                              imu_data.gyro_y  * imu_data.gyro_y  +
+                              imu_data.gyro_z  * imu_data.gyro_z);
+            bool fast_moving = (gps_data.speed >= GPS_STATIC_SPEED_KMH) ||
+                               (fabsf(fam - 1.0f) >= IMU_ACCEL_DEVIATION) ||
+                               (fgm >= IMU_GYRO_STATIC_DPS);
+            if (fast_moving) {
+                fast_motion_ticks++;
+                if (fast_motion_ticks >= MOTION_CONFIRM_TICKS) {
+                    power_state_t old_state  = g_power_state;
+                    g_power_state            = POWER_STATE_MOVING;
+                    current_log_interval_ms  = LOG_INTERVAL_MOVING_MS;
+                    stationary_time_ms       = 0;
+                    motion_confirm_count     = 0;
+                    static_lock_ticks        = 0;
+                    was_stationary           = false;
+                    if (position_locked) {
+                        position_locked = false;
+                        ESP_LOGI(TAG, "GPS position lock released (fast motion)");
+                    }
+                    // Snap EMA to raw position so tracking resumes responsively
+                    ema_lat = gps_data.latitude;
+                    ema_lon = gps_data.longitude;
+                    ema_alt = gps_data.altitude;
+                    update_power_mode(g_power_state, old_state);
+                    fast_motion_ticks = 0;
+                }
+            } else {
+                fast_motion_ticks = 0;
+            }
+        } else {
+            fast_motion_ticks = 0;
         }
 
         // ── Log tick gate ─────────────────────────────────────────────────────
@@ -1731,9 +1823,15 @@ static void gps_logging_task(void *pvParameters)
                          (gm < IMU_GYRO_STATIC_DPS) &&
                          (gps_data.speed < GPS_STATIC_SPEED_KMH);
 
-            // Update gate for the per-fix EMA block (IMU-only, see comment there)
-            imu_static_last = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
-                               (gm < IMU_GYRO_STATIC_DPS);
+            // Update gate for the per-fix EMA block.
+            // GPS speed is the primary indicator: if the receiver reports low
+            // speed the EMA is preserved regardless of IMU reading.  The EMA
+            // only snaps to raw position when BOTH GPS speed AND IMU confirm
+            // real motion, preventing occasional IMU noise from invalidating
+            // hours of accumulated EMA smoothing.
+            imu_static_last = (gps_data.speed < GPS_STATIC_SPEED_KMH) ||
+                              ((fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
+                               (gm < IMU_GYRO_STATIC_DPS));
 
             // ── Progressive power management ──────────────────────────────────
             // Track stationary time and transition through power states:
@@ -1742,7 +1840,19 @@ static void gps_logging_task(void *pvParameters)
             //   Stage 2 (LP) -> 5+ mins:   5min logging, NO uploads, low power mode
             if (stationary) {
                 stationary_time_ms += current_log_interval_ms;
-                
+
+                // ── Position lock ──────────────────────────────────────────────
+                static_lock_ticks++;
+                if (!position_locked && static_lock_ticks >= GPS_POSITION_LOCK_TICKS) {
+                    position_locked = true;
+                    locked_lat_f = (float)ema_lat;
+                    locked_lon_f = (float)ema_lon;
+                    locked_alt_f = ema_alt;
+                    ESP_LOGI(TAG, "GPS position locked at %.6f, %.6f after %" PRIu32 " s static",
+                             (double)locked_lat_f, (double)locked_lon_f,
+                             static_lock_ticks * current_log_interval_ms / 1000);
+                }
+
                 power_state_t old_state = g_power_state;
                 
                 // Transition to Stage 2: Low power mode (5+ minutes static)
@@ -1766,24 +1876,32 @@ static void gps_logging_task(void *pvParameters)
                     }
                 }
             } else {
-                // Device is moving - immediately restore fast logging and full power
-                if (was_stationary) {
-                    if (g_power_state != POWER_STATE_MOVING) {
+                // Debounce: require MOTION_CONFIRM_TICKS consecutive moving reads
+                // before treating the device as actually moving.  This prevents
+                // brief GPS speed noise spikes from resetting stationary_time_ms.
+                motion_confirm_count++;
+                if (motion_confirm_count >= MOTION_CONFIRM_TICKS) {
+                    // Device is confirmed moving - restore fast logging and full power
+                    if (was_stationary || g_power_state != POWER_STATE_MOVING) {
                         power_state_t old_state = g_power_state;
-                        ESP_LOGI(TAG, "Motion detected - exiting power saving mode");
+                        ESP_LOGI(TAG, "Motion confirmed (%u ticks) - exiting power saving mode", motion_confirm_count);
                         ESP_LOGI(TAG, "Restoring fast log rate (%lu ms) and full uploads", LOG_INTERVAL_MOVING_MS);
                         g_power_state = POWER_STATE_MOVING;
                         update_power_mode(g_power_state, old_state);
                     }
+                    stationary_time_ms = 0;
+                    current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
+                    // Release position lock so EMA can track the moving position
+                    if (position_locked) {
+                        ESP_LOGI(TAG, "GPS position lock released (motion confirmed)");
+                        position_locked = false;
+                    }
+                    static_lock_ticks = 0;
                 }
-                stationary_time_ms = 0;
-                current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
-                if (g_power_state != POWER_STATE_MOVING) {
-                    power_state_t old_state = g_power_state;
-                    g_power_state = POWER_STATE_MOVING;
-                    update_power_mode(g_power_state, old_state);
-                }
+                // While debouncing, leave stationary_time_ms untouched so a
+                // subsequent static reading can resume accumulating correctly.
             }
+            if (stationary) motion_confirm_count = 0;
             was_stationary = stationary;
         }
 
@@ -1888,28 +2006,46 @@ static void gps_logging_task(void *pvParameters)
 static void update_power_mode(power_state_t new_state, power_state_t old_state)
 {
     if (new_state == old_state) return;
-    
+
+    const char *from = (old_state == POWER_STATE_MOVING) ? "MOVING" :
+                       (old_state == POWER_STATE_STAGE1) ? "STAGE1" : "STAGE2";
+    const char *to   = (new_state == POWER_STATE_MOVING) ? "MOVING" :
+                       (new_state == POWER_STATE_STAGE1) ? "STAGE1" : "STAGE2";
+
+    ESP_LOGW(TAG, "========================================");
+    ESP_LOGW(TAG, "  POWER STATE: %s  -->  %s", from, to);
+    ESP_LOGW(TAG, "========================================");
+
     switch (new_state) {
         case POWER_STATE_MOVING:
-            // Restore normal power mode
-            if (old_state == POWER_STATE_STAGE2) {
-                ESP_LOGI(TAG, "Exiting low power mode - full operation restored");
-            }
+            ESP_LOGW(TAG, "  Motion detected — full operation restored");
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%.1f s)",
+                     LOG_INTERVAL_MOVING_MS, LOG_INTERVAL_MOVING_MS / 1000.0f);
+            ESP_LOGW(TAG, "  WiFi upload: ENABLED");
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE");
             break;
-            
+
         case POWER_STATE_STAGE1:
-            // Moderate power saving - just reduced logging
-            ESP_LOGI(TAG, "Stage 1 power saving - reduced logging frequency");
+            ESP_LOGW(TAG, "  Static >%lu min — reducing log frequency",
+                     STATIC_STAGE1_THRESHOLD_MS / 60000UL);
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%lu min)",
+                     LOG_INTERVAL_STAGE1_MS, LOG_INTERVAL_STAGE1_MS / 60000UL);
+            ESP_LOGW(TAG, "  WiFi upload: ENABLED");
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE");
             break;
-            
+
         case POWER_STATE_STAGE2:
-            // Aggressive power saving - minimal logging, no uploads
-            ESP_LOGI(TAG, "Stage 2 low power mode - minimal logging, WiFi uploads disabled");
-            ESP_LOGI(TAG, "ESP-NOW sync remains active to respond to peer requests");
-            // Note: WiFi power save (WIFI_PS_MIN_MODEM) is already enabled at init
-            // This mode is compatible with ESP-NOW operation
+            ESP_LOGW(TAG, "  Static >%lu min — entering low power mode",
+                     STATIC_STAGE2_THRESHOLD_MS / 60000UL);
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%lu min)",
+                     LOG_INTERVAL_STAGE2_MS, LOG_INTERVAL_STAGE2_MS / 60000UL);
+            ESP_LOGW(TAG, "  WiFi upload: PERIODIC (%lu min interval)",
+                     LOG_INTERVAL_STAGE2_MS / 60000UL);
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE (peer sync continues)");
             break;
     }
+
+    ESP_LOGW(TAG, "========================================");
 }
 
 /* ==================== Motion Detection ==================== */
@@ -2013,10 +2149,18 @@ static void sync_state_machine_task(void *pv)
         while (motion_is_static() && search_time < SYNC_SEARCH_TIME_MAX) {
 
             // ── WiFi upload ───────────────────────────────────────────────────
-            // Skip uploads entirely when in Stage 2 (low power mode)
-            if (g_power_state != POWER_STATE_STAGE2) {
+            // Upload in all power states.  In Stage2 use the log-rate interval
+            // (5 min) so data is not lost if the device is never recovered.
+            {
+                int64_t upload_interval_s = (g_power_state == POWER_STATE_STAGE2)
+                                            ? (int64_t)(LOG_INTERVAL_STAGE2_MS / 1000)
+                                            : (int64_t)SYNC_WIFI_UPLOAD_INTERVAL_S;
                 int64_t now_s = esp_timer_get_time() / 1000000LL;
                 if (now_s >= next_wifi_attempt) {
+                    if (g_power_state == POWER_STATE_STAGE2) {
+                        ESP_LOGI(TAG, "[%d] Stage2 periodic upload (every %lld s)...",
+                                 search_time, upload_interval_s);
+                    }
                     // Attempt to connect if not already connected
                     if (!wifi_is_connected()) {
                         ESP_LOGI(TAG, "[%d] WiFi not connected - attempting to connect...", search_time);
@@ -2024,29 +2168,21 @@ static void sync_state_machine_task(void *pv)
                             ESP_LOGW(TAG, "[%d] WiFi connection failed - skipping upload", search_time);
                         }
                     }
-                    
+
                     // Upload if we're now connected
                     if (wifi_is_connected()) {
                         ESP_LOGI(TAG, "[%d] WiFi up – uploading sync files...", search_time);
                         if (wifi_upload_all_csv()) {
-                            // wifi_upload_all_csv() now manages file lifecycle
-                            // internally (staging + delete on confirmed success).
-                            // Do NOT call sd_delete_data_file() here — it would
-                            // destroy records written since staging began.
+                            // wifi_upload_all_csv() manages file lifecycle internally
+                            // (staging + delete on confirmed success).
                             ESP_LOGI(TAG, "Upload OK");
                             espnow_sync_reset_peer_states();
                         } else {
                             ESP_LOGW(TAG, "Upload failed – will retry");
                         }
                     }
-                    
-                    next_wifi_attempt = (esp_timer_get_time() / 1000000LL)
-                                        + SYNC_WIFI_UPLOAD_INTERVAL_S;
-                }
-            } else {
-                // In low power mode - skip WiFi uploads  but still respond to ESP-NOW sync
-                if (search_time == 0) {
-                    ESP_LOGI(TAG, "Low power mode active - WiFi uploads disabled");
+
+                    next_wifi_attempt = (esp_timer_get_time() / 1000000LL) + upload_interval_s;
                 }
             }
 
