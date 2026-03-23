@@ -364,6 +364,20 @@ void espnow_sync_reset_peer_states(void)
     //ESP_LOGI(TAG, "Per-peer sync state cleared");
 }
 
+void espnow_sync_reset_own_state(void)
+{
+    for (int i = 0; i < s_peer_state_count; i++) {
+        s_peer_states[i].last_sent_timestamp = 0;
+    }
+}
+
+void espnow_sync_reset_merged_state(void)
+{
+    for (int i = 0; i < s_peer_state_count; i++) {
+        s_peer_states[i].last_merged_row = 0;
+    }
+}
+
 int espnow_sync_round(void)
 {
     int peers_synced = 0;

@@ -62,6 +62,13 @@ int  sd_record_count(void);
  */
 bool sd_delete_data_file(void);
 
+/**
+ * @brief Rename CSV_DATA_FILE to CSV_DATA_BACKUP, then create a fresh
+ *        CSV_DATA_FILE.  Any previous backup is overwritten.
+ * @return true on success.
+ */
+bool sd_backup_data_file(void);
+
 // ─── Peer-data (merged) file ──────────────────────────────────────────────────
 
 /**
@@ -85,6 +92,13 @@ int  sd_read_merged(char *buf, size_t buf_size);
  * @return true on success.
  */
 bool sd_delete_merged_file(void);
+
+/**
+ * @brief Rename CSV_MERGED_FILE to CSV_MERGED_BACKUP, then create a fresh
+ *        CSV_MERGED_FILE.  Any previous backup is overwritten.
+ * @return true on success.
+ */
+bool sd_backup_merged_file(void);
 
 /**
  * @brief Read the entire CSV_DATA_FILE into a caller-allocated buffer.

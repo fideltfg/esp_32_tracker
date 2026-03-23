@@ -1151,6 +1151,12 @@ static esp_err_t http_get_handler(httpd_req_t *req)
     http_emit_file_row(req, "sync_merged.csv", CSV_MERGED_FILE);
     httpd_resp_sendstr_chunk(req, "</table>");
 
+    // ── Backup files (kept after successful upload for verification) ───────────
+    httpd_resp_sendstr_chunk(req, "<h2>Backup Files</h2><table>");
+    http_emit_file_row(req, "sync_data.bak",   CSV_DATA_BACKUP);
+    http_emit_file_row(req, "sync_merged.bak", CSV_MERGED_BACKUP);
+    httpd_resp_sendstr_chunk(req, "</table>");
+
     // \u2500\u2500 Connection log \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     httpd_resp_sendstr_chunk(req, "<h2>Connection Log</h2><table>");
     http_emit_file_row(req, "connections.csv", CONNECTIONS_LOG_FILE);
@@ -1714,15 +1720,27 @@ static void sync_state_machine_task(void *pv)
                     // Upload if we're now connected
                     if (wifi_is_connected()) {
                         ESP_LOGI(TAG, "[%d] WiFi up \u2013 uploading sync files...", search_time);
-                        if (wifi_upload_all_csv()) {
-                            ESP_LOGI(TAG, "Upload OK \u2013 resetting sync files");
-                            sd_delete_data_file();
-                            sd_ensure_data_file();
-                            sd_delete_merged_file();
-                            sd_ensure_merged_file();
-                            espnow_sync_reset_peer_states();
+                        wifi_upload_report_t upload_report = { 0 };
+                        if (wifi_upload_all_csv(&upload_report)) {
+                            bool own_uploaded = (upload_report.own_data == WIFI_UPLOAD_UPLOADED);
+                            bool merged_uploaded = (upload_report.merged_data == WIFI_UPLOAD_UPLOADED);
+
+                            if (own_uploaded || merged_uploaded) {
+                                ESP_LOGI(TAG, "Upload OK - clearing successfully uploaded sync files");
+                            } else {
+                                ESP_LOGI(TAG, "No new sync rows uploaded");
+                            }
+
+                            if (own_uploaded) {
+                                sd_backup_data_file();
+                                espnow_sync_reset_own_state();
+                            }
+                            if (merged_uploaded) {
+                                sd_backup_merged_file();
+                                espnow_sync_reset_merged_state();
+                            }
                         } else {
-                            ESP_LOGW(TAG, "Upload failed \u2013 will retry");
+                            ESP_LOGW(TAG, "Upload failed - preserved pending sync files for retry");
                         }
                     }
                     

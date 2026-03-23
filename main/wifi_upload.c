@@ -248,35 +248,33 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         memcpy(ctx->buf + ctx->len, evt->data, copy);
         ctx->len += copy;
         ctx->buf[ctx->len] = '\0';
-    } else if (evt->event_id == HTTP_EVENT_ON_FINISH) {
-        ctx->len = 0; // reset between redirects
     }
     return ESP_OK;
 }
 
 // ─── Generic file upload ──────────────────────────────────────────────────────
 
-static bool upload_file(const char *label, int (*reader)(char *, size_t))
+static wifi_upload_result_t upload_file(const char *label, int (*reader)(char *, size_t))
 {
     const size_t READ_BUF = 32 * 1024;
     char *csv_buf = malloc(READ_BUF);
     if (!csv_buf) {
        // ESP_LOGE(TAG, "OOM allocating read buffer");
-        return false;
+        return WIFI_UPLOAD_FAILED;
     }
 
     int csv_len = reader(csv_buf, READ_BUF);
     if (csv_len <= 0) {
         //ESP_LOGI(TAG, "%s: nothing to upload", label);
         free(csv_buf);
-        return true; // nothing to do is not a failure
+        return WIFI_UPLOAD_NO_DATA;
     }
 
     char *json = csv_to_json(csv_buf, csv_len);
     free(csv_buf);
     if (!json) {
         //ESP_LOGI(TAG, "%s: no data rows after CSV\u2192JSON conversion", label);
-        return true;
+        return WIFI_UPLOAD_NO_DATA;
     }
 
     ESP_LOGI(TAG, "%s: uploading %d bytes of JSON to %s", label, (int)strlen(json), UPLOAD_URL);
@@ -284,7 +282,7 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
 
     const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
-    if (!resp_buf) { free(json); return false; }
+    if (!resp_buf) { free(json); return WIFI_UPLOAD_FAILED; }
 
     resp_ctx_t resp_ctx = { .buf = resp_buf, .len = 0, .cap = RESP_BUF };
 
@@ -305,7 +303,7 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
         ESP_LOGE(TAG, "%s: Failed to initialize HTTP client", label);
         free(json);
         free(resp_buf);
-        return false;
+        return WIFI_UPLOAD_FAILED;
     }
     
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -313,12 +311,12 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     esp_http_client_set_post_field(client, json, (int)strlen(json));
 
     esp_err_t err = esp_http_client_perform(client);
-    bool ok = false;
+    wifi_upload_result_t result = WIFI_UPLOAD_FAILED;
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
             ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
-            ok = true;
+            result = WIFI_UPLOAD_UPLOADED;
         } else {
             ESP_LOGW(TAG, "%s: rejected by server (status=%d): %s", label, status, resp_buf);
         }
@@ -335,31 +333,42 @@ static bool upload_file(const char *label, int (*reader)(char *, size_t))
     // Give the TCP stack time to release the socket
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    return ok;
+    return result;
 }
 
-bool wifi_upload_csv(void)
+wifi_upload_result_t wifi_upload_csv(void)
 {
     return upload_file("own-data", sd_read_all);
 }
 
-bool wifi_upload_merged_csv(void)
+wifi_upload_result_t wifi_upload_merged_csv(void)
 {
     return upload_file("peer-data", sd_read_merged);
 }
 
-bool wifi_upload_all_csv(void)
+bool wifi_upload_all_csv(wifi_upload_report_t *report)
 {
-    bool own_ok    = wifi_upload_csv();
-    if(!own_ok) {
+    wifi_upload_report_t local_report = {
+        .own_data = WIFI_UPLOAD_NO_DATA,
+        .merged_data = WIFI_UPLOAD_NO_DATA,
+    };
+
+    local_report.own_data = wifi_upload_csv();
+    if (local_report.own_data == WIFI_UPLOAD_FAILED) {
         ESP_LOGW(TAG, "Own data upload failed – skipping peer upload");
+        if (report) {
+            *report = local_report;
+        }
         return false;
     }
     
     // Brief delay between uploads to ensure socket is fully released
     vTaskDelay(pdMS_TO_TICKS(200));
     
-    bool merged_ok = wifi_upload_merged_csv();
-    (void)merged_ok; // peer upload failure is non-fatal
-    return own_ok;
+    local_report.merged_data = wifi_upload_merged_csv();
+    if (report) {
+        *report = local_report;
+    }
+
+    return local_report.merged_data != WIFI_UPLOAD_FAILED;
 }

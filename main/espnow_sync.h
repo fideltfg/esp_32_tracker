@@ -57,3 +57,19 @@ int espnow_sync_round(void);
  * the next sync with each peer starts from row 0 of the fresh file.
  */
 void espnow_sync_reset_peer_states(void);
+
+/**
+ * @brief Reset only the per-peer own-data timestamp watermarks.
+ *
+ * Call this when sync_data.csv is deleted and recreated but merged data is
+ * retained, so peers do not miss new rows from the fresh file.
+ */
+void espnow_sync_reset_own_state(void);
+
+/**
+ * @brief Reset only the per-peer merged-data row offsets.
+ *
+ * Call this when sync_merged.csv is deleted and recreated but own data is
+ * retained, so peers do not skip rows in the fresh merged file.
+ */
+void espnow_sync_reset_merged_state(void);

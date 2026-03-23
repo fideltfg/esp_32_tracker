@@ -159,6 +159,26 @@ bool sd_delete_data_file(void)
     return ok;
 }
 
+bool sd_backup_data_file(void)
+{
+    sd_lock();
+    // Remove any previous backup so rename cannot fail with EEXIST.
+    remove(CSV_DATA_BACKUP);
+    bool ok = (rename(CSV_DATA_FILE, CSV_DATA_BACKUP) == 0);
+    if (!ok) {
+        ESP_LOGE(TAG, "Cannot rename %s -> %s", CSV_DATA_FILE, CSV_DATA_BACKUP);
+        sd_unlock();
+        return false;
+    }
+    ESP_LOGI(TAG, "Backed up %s -> %s", CSV_DATA_FILE, CSV_DATA_BACKUP);
+    // Create a fresh empty file ready for new records.
+    FILE *f = fopen(CSV_DATA_FILE, "w");
+    if (f) fclose(f);
+    ESP_LOGI(TAG, "Created fresh %s", CSV_DATA_FILE);
+    sd_unlock();
+    return true;
+}
+
 // ─── Peer-data (merged) file ──────────────────────────────────────────────────
 
 bool sd_ensure_merged_file(void)
@@ -218,6 +238,24 @@ bool sd_delete_merged_file(void)
     if (ok) ESP_LOGI(TAG, "Deleted %s", CSV_MERGED_FILE);
     else    ESP_LOGE(TAG, "Cannot delete %s", CSV_MERGED_FILE);
     return ok;
+}
+
+bool sd_backup_merged_file(void)
+{
+    sd_lock();
+    remove(CSV_MERGED_BACKUP);
+    bool ok = (rename(CSV_MERGED_FILE, CSV_MERGED_BACKUP) == 0);
+    if (!ok) {
+        ESP_LOGE(TAG, "Cannot rename %s -> %s", CSV_MERGED_FILE, CSV_MERGED_BACKUP);
+        sd_unlock();
+        return false;
+    }
+    ESP_LOGI(TAG, "Backed up %s -> %s", CSV_MERGED_FILE, CSV_MERGED_BACKUP);
+    FILE *f = fopen(CSV_MERGED_FILE, "w");
+    if (f) fclose(f);
+    ESP_LOGI(TAG, "Created fresh %s", CSV_MERGED_FILE);
+    sd_unlock();
+    return true;
 }
 
 int sd_read_all(char *buf, size_t buf_size)

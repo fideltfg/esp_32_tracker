@@ -6,6 +6,17 @@
  * @brief WiFi station connect/disconnect and HTTP CSV upload.
  */
 
+typedef enum {
+	WIFI_UPLOAD_FAILED = 0,
+	WIFI_UPLOAD_NO_DATA,
+	WIFI_UPLOAD_UPLOADED,
+} wifi_upload_result_t;
+
+typedef struct {
+	wifi_upload_result_t own_data;
+	wifi_upload_result_t merged_data;
+} wifi_upload_report_t;
+
 /**
  * @brief Initialise the WiFi stack and event loop (call once at boot).
  */
@@ -29,23 +40,20 @@ bool wifi_is_connected(void);
 
 /**
  * @brief POST the contents of CSV_DATA_FILE to UPLOAD_URL.
- *        On HTTP 200/201 the function returns true; the caller should then
- *        delete the file via sd_delete_data_file().
- * @return true on successful upload (server accepted the data).
+ * @return Result indicating failure, no data, or successful upload.
  */
-bool wifi_upload_csv(void);
+wifi_upload_result_t wifi_upload_csv(void);
 
 /**
  * @brief Upload own data first, then peer data (if any).
  *        Calls wifi_upload_csv() then wifi_upload_merged_csv() sequentially.
- *        Returns true only if the own-data upload succeeded (peer upload
- *        failure is logged but does not affect the return value).
+ *        Returns true only when neither upload failed. The report contains the
+ *        per-file outcome so the caller can clear only what was uploaded.
  */
-bool wifi_upload_all_csv(void);
+bool wifi_upload_all_csv(wifi_upload_report_t *report);
 
 /**
  * @brief POST the contents of CSV_MERGED_FILE to UPLOAD_URL.
- *        Silently succeeds (returns true) if the file does not exist yet.
- * @return true on successful upload or if there was nothing to upload.
+ * @return Result indicating failure, no data, or successful upload.
  */
-bool wifi_upload_merged_csv(void);
+wifi_upload_result_t wifi_upload_merged_csv(void);
