@@ -68,6 +68,8 @@ typedef struct {
     float longitude;
     float altitude;
     float speed;
+    float hdop;    // horizontal dilution of precision (from GPGGA)
+    int   num_sv;  // satellites in use (from GPGGA)
     bool valid;
 } gps_data_t;
 
@@ -90,7 +92,7 @@ static char g_own_mac_str[5] = {0}; // "AABB\0" – last 4 hex digits of WiFi MA
 typedef enum {
     POWER_STATE_MOVING = 0,  // Device moving: 1s logging, full uploads
     POWER_STATE_STAGE1 = 1,  // Static 3+ mins: 1min logging, full uploads
-    POWER_STATE_STAGE2 = 2,  // Static 5+ mins: 5min logging, NO uploads, low power
+    POWER_STATE_STAGE2 = 2,  // Static 5+ mins: 5min logging, periodic uploads (5min), low power
 } power_state_t;
 
 static volatile power_state_t g_power_state = POWER_STATE_MOVING;
@@ -897,24 +899,36 @@ static bool parse_gprmc(const char *nmea, gps_data_t *gps_data)
 
 static bool parse_gpgga(const char *nmea, gps_data_t *gps_data)
 {
-    // $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
+    // $GPGGA,HHMMSS,Lat,N/S,Lon,E/W,FS,NoSV,HDOP,AltMSL,M,...
+    //   FS   = fix status (0=invalid, 1=GPS, 2=DGPS/SBAS)
+    //   NoSV = satellites in use
+    //   HDOP = horizontal dilution of precision
     char *token;
     char nmea_copy[128];
     strncpy(nmea_copy, nmea, sizeof(nmea_copy) - 1);
-    
+    nmea_copy[sizeof(nmea_copy) - 1] = '\0';
+
     token = strtok(nmea_copy, ",");
     if (!token || strcmp(token, "$GPGGA") != 0) return false;
-    
-    // Skip to altitude (9th field)
-    for (int i = 0; i < 8; i++) {
-        token = strtok(NULL, ",");
-    }
-    
-    token = strtok(NULL, ","); // Altitude
-    if (token) {
-        gps_data->altitude = atof(token);
-    }
-    
+
+    token = strtok(NULL, ","); // Time
+    token = strtok(NULL, ","); // Latitude (skip — already in RMC)
+    token = strtok(NULL, ","); // N/S
+    token = strtok(NULL, ","); // Longitude (skip)
+    token = strtok(NULL, ","); // E/W
+
+    token = strtok(NULL, ","); // Fix status
+    if (!token || token[0] == '0') return false; // no fix
+
+    token = strtok(NULL, ","); // Number of satellites
+    if (token) gps_data->num_sv = atoi(token);
+
+    token = strtok(NULL, ","); // HDOP
+    if (token) gps_data->hdop = atof(token);
+
+    token = strtok(NULL, ","); // Altitude (MSL)
+    if (token) gps_data->altitude = atof(token);
+
     return true;
 }
 
@@ -936,6 +950,217 @@ static void gps_uart_init(void)
     uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     
     ESP_LOGI(TAG, "GPS UART initialized");
+}
+
+// Compute the Fletcher-8 checksum used by all UBX packets.
+// The checksum covers every byte from the Class field up to (but not
+// including) the two checksum bytes at the end of the message.
+static void ubx_checksum(const uint8_t *data, size_t len,
+                          uint8_t *ck_a, uint8_t *ck_b)
+{
+    *ck_a = 0;
+    *ck_b = 0;
+    for (size_t i = 0; i < len; i++) {
+        *ck_a = (uint8_t)(*ck_a + data[i]);
+        *ck_b = (uint8_t)(*ck_b + *ck_a);
+    }
+}
+
+// Send one UBX packet (sync chars + payload + checksum) over GPS_UART_NUM.
+static void ubx_send(uint8_t *msg, size_t len)
+{
+    // msg[] layout: 0xB5, 0x62, class, id, lenL, lenH, payload..., 0x00, 0x00
+    // Checksum covers bytes [2 .. len-3].
+    ubx_checksum(&msg[2], len - 4, &msg[len - 2], &msg[len - 1]);
+    uart_write_bytes(GPS_UART_NUM, (const char *)msg, (int)len);
+}
+
+// Wait for a UBX-ACK-ACK or UBX-ACK-NAK response to the command identified
+// by (ack_cls, ack_id).  Returns true on ACK-ACK, false on ACK-NAK or timeout.
+// The module may still be emitting NMEA before the ACK arrives so we scan the
+// raw byte stream for the UBX sync preamble rather than assuming clean framing.
+static bool ubx_wait_ack(uint8_t ack_cls, uint8_t ack_id)
+{
+    // UBX-ACK packet layout (10 bytes total):
+    //   B5 62  — sync
+    //   05 xx  — class 0x05, id 0x01=ACK-ACK / 0x00=ACK-NAK
+    //   02 00  — payload length = 2
+    //   cc ii  — clsID and msgID of the acknowledged message
+    //   CK_A CK_B
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(300);
+    uint8_t buf[1];
+    uint8_t state = 0; // simple byte-by-byte state machine
+
+    // Byte positions we care about while scanning:
+    //  state 0: looking for 0xB5
+    //  state 1: looking for 0x62
+    //  state 2: looking for class 0x05
+    //  state 3: ACK id byte (0x01 or 0x00)
+    //  state 4: payload len low  (must be 0x02)
+    //  state 5: payload len high (must be 0x00)
+    //  state 6: clsID of acked msg
+    //  state 7: msgID of acked msg
+    uint8_t ack_type = 0;
+
+    while (xTaskGetTickCount() < deadline) {
+        int n = uart_read_bytes(GPS_UART_NUM, buf, 1, pdMS_TO_TICKS(10));
+        if (n <= 0) continue;
+
+        switch (state) {
+            case 0: if (buf[0] == 0xB5) state = 1; break;
+            case 1: state = (buf[0] == 0x62) ? 2 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 2: state = (buf[0] == 0x05) ? 3 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 3:
+                if (buf[0] == 0x01 || buf[0] == 0x00) {
+                    ack_type = buf[0]; // 0x01 = ACK, 0x00 = NAK
+                    state = 4;
+                } else {
+                    state = (buf[0] == 0xB5) ? 1 : 0;
+                }
+                break;
+            case 4: state = (buf[0] == 0x02) ? 5 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 5: state = (buf[0] == 0x00) ? 6 : (buf[0] == 0xB5 ? 1 : 0); break;
+            case 6:
+                if (buf[0] == ack_cls) { state = 7; }
+                else                   { state = (buf[0] == 0xB5) ? 1 : 0; }
+                break;
+            case 7:
+                if (buf[0] == ack_id) {
+                    return (ack_type == 0x01); // true = ACK-ACK
+                }
+                state = (buf[0] == 0xB5) ? 1 : 0;
+                break;
+            default: state = 0; break;
+        }
+    }
+    return false; // timeout
+}
+
+// Configure the NEO-6M for 5 Hz updates and disable the NMEA sentences that
+// the parser never reads (GLL, GSA, GSV, VTG).  Only GGA and RMC are kept,
+// which keeps the UART load comfortably within 9600 baud at 5 Hz.
+//
+// Changes take effect immediately but are lost on power-cycle unless the
+// module has battery-backed RAM and a CFG-CFG save is sent.
+static void gps_configure_5hz(void)
+{
+    // A brief warm-up delay lets the module finish its startup NMEA burst
+    // before we send UBX config, reducing the chance of a NACK.
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // ── Disable unneeded NMEA sentences ──────────────────────────────────────
+    // UBX-CFG-MSG (3-byte payload): msgClass, msgId, rate
+    //   rate = 0  → disabled on all ports
+    //   rate = 1  → enabled  on all ports
+    // Sentences we turn off: GLL (F0 01), GSA (F0 02), GSV (F0 03), VTG (F0 05)
+    static const struct { uint8_t cls; uint8_t id; const char *name; } disable[] = {
+        { 0xF0, 0x01, "GLL" },
+        { 0xF0, 0x02, "GSA" },
+        { 0xF0, 0x03, "GSV" },
+        { 0xF0, 0x05, "VTG" },
+    };
+    for (int i = 0; i < (int)(sizeof(disable) / sizeof(disable[0])); i++) {
+        uint8_t msg[] = {
+            0xB5, 0x62,                       // UBX sync
+            0x06, 0x01,                       // CFG-MSG
+            0x03, 0x00,                       // payload length = 3
+            disable[i].cls, disable[i].id,    // sentence class / id
+            0x00,                             // rate = 0 (disabled)
+            0x00, 0x00                        // CK_A, CK_B (filled by ubx_send)
+        };
+        ubx_send(msg, sizeof(msg));
+        if (ubx_wait_ack(0x06, 0x01)) {
+            ESP_LOGI(TAG, "NEO-6M: disabled %s (ACK-ACK)", disable[i].name);
+        } else {
+            ESP_LOGE(TAG, "NEO-6M: disable %s failed (ACK-NAK or timeout)", disable[i].name);
+        }
+    }
+
+    // ── Set 5 Hz navigation update rate ──────────────────────────────────────
+    // UBX-CFG-RATE payload:
+    //   measRate = 200 ms (0x00C8) — measurement period
+    //   navRate  = 1      (0x0001) — navigation cycles per measurement
+    //   timeRef  = 1      (0x0001) — GPS time reference
+    uint8_t rate_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x08,              // CFG-RATE
+        0x06, 0x00,              // payload length = 6
+        0xC8, 0x00,              // measRate = 200 ms
+        0x01, 0x00,              // navRate  = 1
+        0x01, 0x00,              // timeRef  = 1 (GPS time)
+        0x00, 0x00               // CK_A, CK_B (filled by ubx_send)
+    };
+    ubx_send(rate_msg, sizeof(rate_msg));
+    if (ubx_wait_ack(0x06, 0x08)) {
+        ESP_LOGI(TAG, "NEO-6M: 5 Hz rate set (ACK-ACK)");
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: 5 Hz rate set failed (ACK-NAK or timeout)");
+    }
+
+    // ── Navigation engine: pedestrian model + static hold ────────────────────
+    // CFG-NAV5 (0x06 0x24), 36-byte payload.
+    // mask = 0x0041: apply dynModel (bit 0) and staticHoldThresh (bit 6) only.
+    // dynModel = 3 (pedestrian) improves stationary accuracy vs. the default
+    //   portable (0) model by tightening the receiver's motion model.
+    // staticHoldThresh = GPS_STATIC_HOLD_CM_S: below this speed the receiver
+    //   freezes its reported position to suppress multipath wander.
+    uint8_t nav5_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x24,              // CFG-NAV5
+        0x24, 0x00,              // payload length = 36
+        0x41, 0x00,              // mask = 0x0041 (dynModel + staticHold)
+        0x03,                    // dynModel = 3 (pedestrian)
+        0x02,                    // fixMode  = 2 (not applied by mask)
+        0x00, 0x00, 0x00, 0x00,  // fixedAlt
+        0x10, 0x27, 0x00, 0x00,  // fixedAltVar
+        0x05,                    // minElev  = 5°
+        0x00,                    // drLimit
+        0xFA, 0x00,              // pDop = 25.0
+        0xFA, 0x00,              // tDop = 25.0
+        0x64, 0x00,              // pAcc = 100 m
+        0x2C, 0x01,              // tAcc = 300 m
+        GPS_STATIC_HOLD_CM_S,    // staticHoldThresh (cm/s)
+        0x00,                    // dgpsTimeOut
+        0x00, 0x00, 0x00, 0x00,  // reserved2
+        0x00, 0x00, 0x00, 0x00,  // reserved3
+        0x00, 0x00, 0x00, 0x00,  // reserved4
+        0x00, 0x00               // CK_A, CK_B
+    };
+    ubx_send(nav5_msg, sizeof(nav5_msg));
+    if (ubx_wait_ack(0x06, 0x24)) {
+        ESP_LOGI(TAG, "NEO-6M: pedestrian model + static hold set (ACK-ACK)");
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: CFG-NAV5 failed (ACK-NAK or timeout)");
+    }
+
+    // ── SBAS (WAAS / EGNOS / MSAS / GAGAN) ───────────────────────────────────
+    // CFG-SBAS (0x06 0x16), 8-byte payload.
+    // mode  = 0x07: enable + ranging + differential corrections
+    // usage = 0x03: use SBAS for ranging and differential corrections
+    // scanmode1 = 0: auto-detect all available SBAS PRNs
+    uint8_t sbas_msg[] = {
+        0xB5, 0x62,              // UBX sync
+        0x06, 0x16,              // CFG-SBAS
+        0x08, 0x00,              // payload length = 8
+        0x07,                    // mode: enable + ranging + correction
+        0x03,                    // usage: ranging + diffCorr
+        0x03,                    // maxSBAS = 3 channels
+        0x00,                    // scanmode2
+        // scanmode1: PRN bitmask derived from GPS_SBAS_REGION in sync_config.h.
+        // Bit N = PRN (120+N).  0x00000000 = auto-scan all.
+        (uint8_t)((GPS_SBAS_REGION)        & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >>  8)  & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >> 16)  & 0xFF),
+        (uint8_t)((GPS_SBAS_REGION >> 24)  & 0xFF),
+        0x00, 0x00               // CK_A, CK_B
+    };
+    ubx_send(sbas_msg, sizeof(sbas_msg));
+    if (ubx_wait_ack(0x06, 0x16)) {
+        ESP_LOGI(TAG, "NEO-6M: SBAS enabled, region mask=0x%08lX (ACK-ACK)",
+                 (unsigned long)GPS_SBAS_REGION);
+    } else {
+        ESP_LOGE(TAG, "NEO-6M: SBAS enable failed (ACK-NAK or timeout)");
+    }
 }
 
 /* ==================== SD Card Functions ==================== */
@@ -985,21 +1210,47 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
     if (!gps_valid || (gps_data->latitude == 0.0 && gps_data->longitude == 0.0)) {
         return ESP_OK; // Don't log invalid positions
     }
-    
+
+    // Skip duplicate positions: if lat, lon AND altitude are all identical to
+    // the last logged entry the device has not moved — no new information to store.
+    // Exception: always write a heartbeat entry at least once per minute so
+    // there is a continuous presence record even during long static periods.
+    static float   last_lat = 0.0f, last_lon = 0.0f, last_alt = 0.0f;
+    static int64_t last_write_ts = 0;
+    #define HEARTBEAT_INTERVAL_S  60
+    int64_t now_ts = (int64_t)time(NULL);
+    bool position_unchanged = (gps_data->latitude  == last_lat &&
+                               gps_data->longitude == last_lon &&
+                               gps_data->altitude  == last_alt);
+    bool heartbeat_due = (now_ts - last_write_ts) >= HEARTBEAT_INTERVAL_S;
+    if (position_unchanged && !heartbeat_due) {
+        return ESP_OK;
+    }
+
+    // Position unchanged → speed must be zero (GPS noise guard).
+    float logged_speed = position_unchanged ? 0.0f : gps_data->speed;
+
     char row[128];
     snprintf(row, sizeof(row),
-             "%" PRId64 ",%.4f,%.4f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
+             "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
              (int64_t)time(NULL),
              gps_data->latitude,
              gps_data->longitude,
              gps_data->altitude,
-             gps_data->speed,
+             logged_speed,
              imu_data->accel_x,
              imu_data->accel_y,
              imu_data->accel_z,
              g_own_mac_str);
 
-    return sd_append_record(row) ? ESP_OK : ESP_FAIL;
+    if (!sd_append_record(row)) return ESP_FAIL;
+
+    // Only update the watermark after a successful write
+    last_lat = gps_data->latitude;
+    last_lon = gps_data->longitude;
+    last_alt = gps_data->altitude;
+    last_write_ts = now_ts;
+    return ESP_OK;
 }
 
 /* ==================== WiFi Functions ==================== */
@@ -1323,18 +1574,51 @@ static void gps_logging_task(void *pvParameters)
     uint32_t lcd_resync_counter = 0;
 
     // EMA filter state — smooths GPS lat/lon/alt while the device is stationary
-    float ema_lat = 0.0f, ema_lon = 0.0f, ema_alt = 0.0f;
-    bool  ema_initialized = false;
-    
+    // double accumulators avoid float precision loss (~0.85 m/bit at mid-latitudes)
+    double ema_lat = 0.0, ema_lon = 0.0;
+    float  ema_alt = 0.0f;
+    bool   ema_initialized = false;
+
     // Adaptive logging interval state — reduces log rate when stationary
     uint32_t stationary_time_ms = 0;
     uint32_t current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
     bool was_stationary = false;
+    // Debounce for motion detection — require this many consecutive "moving" log
+    // ticks before resetting stationary_time_ms.  Prevents GPS speed noise spikes
+    // from restarting the 3-min / 5-min accumulation.
+    uint8_t  motion_confirm_count = 0;
+    #define MOTION_CONFIRM_TICKS  5   // ~5 s at 1 s log rate
+
+    // Sub-second IMU accumulator — IMU is sampled at GPS_SAMPLE_PERIOD_MS and
+    // averaged over the full log interval for more stable motion detection.
+    float      imu_sum_ax = 0.0f, imu_sum_ay = 0.0f, imu_sum_az = 0.0f;
+    float      imu_sum_gx = 0.0f, imu_sum_gy = 0.0f, imu_sum_gz = 0.0f;
+    uint32_t   imu_sample_count = 0;
+    TickType_t last_log_tick = 0;
+    // Persistent filtered position — updated on each GPS fix, used for CSV / LCD
+    gps_data_t log_gps = {0};
+    // Track whether a new GPS fix arrived this loop iteration
+    bool gps_fix_updated = false;
+    // Last known IMU static state — computed at log rate but applied at GPS rate
+    bool imu_static_last = false;
+    // Position lock — after GPS_POSITION_LOCK_TICKS consecutive static log-ticks
+    // the EMA position is frozen and all subsequent logged rows use it unchanged.
+    // This prevents long-term EMA drift during multi-hour stationary periods.
+    uint32_t static_lock_ticks = 0;
+    bool     position_locked   = false;
+    float    locked_lat_f      = 0.0f;
+    float    locked_lon_f      = 0.0f;
+    float    locked_alt_f      = 0.0f;
+    // Fast motion exit counter — ticks every GPS_SAMPLE_PERIOD_MS (200 ms).
+    // When Stage1 or Stage2 is active, movement is detected at full GPS rate
+    // without waiting for the slow log-tick.  MOTION_CONFIRM_TICKS consecutive
+    // moving samples = ~1 s at 200 ms/tick.
+    uint8_t fast_motion_ticks = 0;
     
     ESP_LOGI(TAG, "GPS logging task started");
     
     while (1) {
-        int len = uart_read_bytes(GPS_UART_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(GPS_UART_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(GPS_SAMPLE_PERIOD_MS));
         
         if (len > 0) {
             for (int i = 0; i < len; i++) {
@@ -1346,7 +1630,11 @@ static void gps_logging_task(void *pvParameters)
                         
                         // Parse NMEA sentences
                         if (strncmp(line_buffer, "$GPRMC", 6) == 0) {
+                            bool was_valid = gps_data.valid;
                             parse_gprmc(line_buffer, &gps_data);
+                            // A new valid fix has arrived when status flips to A
+                            if (gps_data.valid) gps_fix_updated = true;
+                            (void)was_valid;
                         } else if (strncmp(line_buffer, "$GPGGA", 6) == 0) {
                             parse_gpgga(line_buffer, &gps_data);
                         }
@@ -1363,6 +1651,17 @@ static void gps_logging_task(void *pvParameters)
         esp_err_t imu_ret = mpu6050_read_data(&imu_data);
         if (imu_ret != ESP_OK && imu_ret != ESP_ERR_INVALID_STATE) {
             ESP_LOGD(TAG, "Failed to read IMU data: %s", esp_err_to_name(imu_ret));
+        }
+
+        // Accumulate IMU at GPS_SAMPLE_PERIOD_MS rate for averaging over the log interval
+        if (imu_ret == ESP_OK) {
+            imu_sum_ax += imu_data.accel_x;
+            imu_sum_ay += imu_data.accel_y;
+            imu_sum_az += imu_data.accel_z;
+            imu_sum_gx += imu_data.gyro_x;
+            imu_sum_gy += imu_data.gyro_y;
+            imu_sum_gz += imu_data.gyro_z;
+            imu_sample_count++;
         }
 
         // Update shared motion state used by the ESP-NOW sync task
@@ -1386,25 +1685,159 @@ static void gps_logging_task(void *pvParameters)
         }
 #endif
 
+        // ── Per-fix EMA update (runs at GPS rate, up to 5 Hz) ────────────────
+        // Update the position filter on every new GPS fix so the EMA has the
+        // maximum number of samples to converge on, rather than only once per
+        // log interval.  imu_static_last is kept current by the log-tick block.
+        if (gps_fix_updated && gps_data.valid) {
+            gps_fix_updated = false;
+
+            // Fix quality gate: skip fixes with poor geometry or too few SVs.
+            // Both conditions must be checked together so a bad HDOP fix cannot
+            // pollute the EMA even when the outlier distance check would pass.
+            if (gps_data.hdop > GPS_MAX_HDOP || gps_data.num_sv < GPS_MIN_SV) {
+                ESP_LOGD(TAG, "GPS fix skipped: HDOP=%.1f SVs=%d",
+                         gps_data.hdop, gps_data.num_sv);
+            } else {
+                // ── EMA filter ────────────────────────────────────────────────
+                if (!ema_initialized) {
+                    ema_lat       = gps_data.latitude;
+                    ema_lon       = gps_data.longitude;
+                    ema_alt       = gps_data.altitude;
+                    ema_initialized = true;
+                } else if (imu_static_last) {
+                    double dlat    = gps_data.latitude  - ema_lat;
+                    double dlon    = gps_data.longitude - ema_lon;
+                    double cos_lat = cos(ema_lat * M_PI / 180.0);
+                    double dist_m  = sqrt((dlat * dlat + dlon * dlon * cos_lat * cos_lat)
+                                          * 111120.0 * 111120.0);
+                    if (dist_m < GPS_OUTLIER_REJECT_M) {
+                        ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0 - GPS_EMA_ALPHA) * ema_lat;
+                        ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0 - GPS_EMA_ALPHA) * ema_lon;
+                        ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
+                    } else {
+                        ESP_LOGD(TAG, "GPS outlier rejected: %.1f m from EMA", (float)dist_m);
+                    }
+                } else {
+                    // Moving — snap filter to raw position so tracking stays responsive
+                    ema_lat = gps_data.latitude;
+                    ema_lon = gps_data.longitude;
+                    ema_alt = gps_data.altitude;
+                }
+
+                // Keep log_gps current at GPS rate so the log-tick always has
+                // the freshest filtered position ready to write.  Bad-quality
+                // fixes do not update log_gps so the last good position persists.
+                log_gps = gps_data;
+                if (position_locked) {
+                    // Position lock active: freeze coordinates to the locked mean.
+                    log_gps.latitude  = locked_lat_f;
+                    log_gps.longitude = locked_lon_f;
+                    log_gps.altitude  = locked_alt_f;
+                } else if (imu_static_last) {
+                    log_gps.latitude  = (float)ema_lat;
+                    log_gps.longitude = (float)ema_lon;
+                    log_gps.altitude  = ema_alt;
+                }
+            }
+        }
+
+        // ── Fast motion detection (runs every GPS_SAMPLE_PERIOD_MS) ───────────
+        // When the device is in Stage1 or Stage2 the log tick fires too
+        // infrequently (1 min / 5 min) to detect movement quickly.  This block
+        // uses instantaneous IMU + GPS speed readings to exit the power-saving
+        // states immediately without waiting for the next slow log tick.
+        if (g_power_state != POWER_STATE_MOVING && gps_data.valid) {
+            float fam = sqrtf(imu_data.accel_x * imu_data.accel_x +
+                              imu_data.accel_y * imu_data.accel_y +
+                              imu_data.accel_z * imu_data.accel_z);
+            float fgm = sqrtf(imu_data.gyro_x  * imu_data.gyro_x  +
+                              imu_data.gyro_y  * imu_data.gyro_y  +
+                              imu_data.gyro_z  * imu_data.gyro_z);
+            bool fast_moving = (gps_data.speed >= GPS_STATIC_SPEED_KMH) ||
+                               (fabsf(fam - 1.0f) >= IMU_ACCEL_DEVIATION) ||
+                               (fgm >= IMU_GYRO_STATIC_DPS);
+            if (fast_moving) {
+                fast_motion_ticks++;
+                if (fast_motion_ticks >= MOTION_CONFIRM_TICKS) {
+                    power_state_t old_state  = g_power_state;
+                    g_power_state            = POWER_STATE_MOVING;
+                    current_log_interval_ms  = LOG_INTERVAL_MOVING_MS;
+                    stationary_time_ms       = 0;
+                    motion_confirm_count     = 0;
+                    static_lock_ticks        = 0;
+                    was_stationary           = false;
+                    if (position_locked) {
+                        position_locked = false;
+                        ESP_LOGI(TAG, "GPS position lock released (fast motion)");
+                    }
+                    // Snap EMA to raw position so tracking resumes responsively
+                    ema_lat = gps_data.latitude;
+                    ema_lon = gps_data.longitude;
+                    ema_alt = gps_data.altitude;
+                    update_power_mode(g_power_state, old_state);
+                    fast_motion_ticks = 0;
+                }
+            } else {
+                fast_motion_ticks = 0;
+            }
+        } else {
+            fast_motion_ticks = 0;
+        }
+
+        // ── Log tick gate ─────────────────────────────────────────────────────
+        // The loop runs at GPS_SAMPLE_PERIOD_MS so the IMU is sampled at ~10 Hz.
+        // The CSV write, EMA filter, and power management only fire when the
+        // log interval has elapsed.
+        {
+            TickType_t now_tick = xTaskGetTickCount();
+            if ((TickType_t)(now_tick - last_log_tick) < pdMS_TO_TICKS(current_log_interval_ms)) {
+                continue;
+            }
+            last_log_tick = now_tick;
+        }
+
+        // ── Average accumulated IMU samples for this log interval ─────────────
+        // Falls back to the most recent instant reading if no samples accumulated.
+        imu_data_t avg_imu = imu_data;
+        if (imu_sample_count > 0) {
+            avg_imu.accel_x = imu_sum_ax / (float)imu_sample_count;
+            avg_imu.accel_y = imu_sum_ay / (float)imu_sample_count;
+            avg_imu.accel_z = imu_sum_az / (float)imu_sample_count;
+            avg_imu.gyro_x  = imu_sum_gx / (float)imu_sample_count;
+            avg_imu.gyro_y  = imu_sum_gy / (float)imu_sample_count;
+            avg_imu.gyro_z  = imu_sum_gz / (float)imu_sample_count;
+            imu_sum_ax = imu_sum_ay = imu_sum_az = 0.0f;
+            imu_sum_gx = imu_sum_gy = imu_sum_gz = 0.0f;
+            imu_sample_count = 0;
+        }
+
         // ── GPS position jitter filter ────────────────────────────────────────
-        // The Neo-6M reports position noise of several meters even when still.
-        // When both IMU and GPS speed agree the device is stationary, apply an
-        // EMA to the logged coordinates so the track doesn't wander.
-        // When motion is detected we snap the filter to the raw position so the
-        // first logged point after moving is accurate.
-        gps_data_t log_gps = gps_data;  // filtered copy used for CSV / LCD
+        // The EMA is now updated at GPS rate (up to 5 Hz) in the per-fix block
+        // above.  Here we only (re-)compute imu_static so the per-fix block has
+        // an up-to-date gate value for the next batch of fixes.
         bool stationary = false;
-        
+
         if (gps_data.valid) {
-            float am = sqrtf(imu_data.accel_x * imu_data.accel_x +
-                             imu_data.accel_y * imu_data.accel_y +
-                             imu_data.accel_z * imu_data.accel_z);
-            float gm = sqrtf(imu_data.gyro_x  * imu_data.gyro_x  +
-                             imu_data.gyro_y  * imu_data.gyro_y  +
-                             imu_data.gyro_z  * imu_data.gyro_z);
+            float am = sqrtf(avg_imu.accel_x * avg_imu.accel_x +
+                             avg_imu.accel_y * avg_imu.accel_y +
+                             avg_imu.accel_z * avg_imu.accel_z);
+            float gm = sqrtf(avg_imu.gyro_x  * avg_imu.gyro_x  +
+                             avg_imu.gyro_y  * avg_imu.gyro_y  +
+                             avg_imu.gyro_z  * avg_imu.gyro_z);
             stationary = (fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
                          (gm < IMU_GYRO_STATIC_DPS) &&
                          (gps_data.speed < GPS_STATIC_SPEED_KMH);
+
+            // Update gate for the per-fix EMA block.
+            // GPS speed is the primary indicator: if the receiver reports low
+            // speed the EMA is preserved regardless of IMU reading.  The EMA
+            // only snaps to raw position when BOTH GPS speed AND IMU confirm
+            // real motion, preventing occasional IMU noise from invalidating
+            // hours of accumulated EMA smoothing.
+            imu_static_last = (gps_data.speed < GPS_STATIC_SPEED_KMH) ||
+                              ((fabsf(am - 1.0f) < IMU_ACCEL_DEVIATION) &&
+                               (gm < IMU_GYRO_STATIC_DPS));
 
             // ── Progressive power management ──────────────────────────────────
             // Track stationary time and transition through power states:
@@ -1413,7 +1846,19 @@ static void gps_logging_task(void *pvParameters)
             //   Stage 2 (LP) -> 5+ mins:   5min logging, NO uploads, low power mode
             if (stationary) {
                 stationary_time_ms += current_log_interval_ms;
-                
+
+                // ── Position lock ──────────────────────────────────────────────
+                static_lock_ticks++;
+                if (!position_locked && static_lock_ticks >= GPS_POSITION_LOCK_TICKS) {
+                    position_locked = true;
+                    locked_lat_f = (float)ema_lat;
+                    locked_lon_f = (float)ema_lon;
+                    locked_alt_f = ema_alt;
+                    ESP_LOGI(TAG, "GPS position locked at %.6f, %.6f after %" PRIu32 " s static",
+                             (double)locked_lat_f, (double)locked_lon_f,
+                             static_lock_ticks * current_log_interval_ms / 1000);
+                }
+
                 power_state_t old_state = g_power_state;
                 
                 // Transition to Stage 2: Low power mode (5+ minutes static)
@@ -1437,44 +1882,33 @@ static void gps_logging_task(void *pvParameters)
                     }
                 }
             } else {
-                // Device is moving - immediately restore fast logging and full power
-                if (was_stationary) {
-                    if (g_power_state != POWER_STATE_MOVING) {
+                // Debounce: require MOTION_CONFIRM_TICKS consecutive moving reads
+                // before treating the device as actually moving.  This prevents
+                // brief GPS speed noise spikes from resetting stationary_time_ms.
+                motion_confirm_count++;
+                if (motion_confirm_count >= MOTION_CONFIRM_TICKS) {
+                    // Device is confirmed moving - restore fast logging and full power
+                    if (was_stationary || g_power_state != POWER_STATE_MOVING) {
                         power_state_t old_state = g_power_state;
-                        ESP_LOGI(TAG, "Motion detected - exiting power saving mode");
+                        ESP_LOGI(TAG, "Motion confirmed (%u ticks) - exiting power saving mode", motion_confirm_count);
                         ESP_LOGI(TAG, "Restoring fast log rate (%lu ms) and full uploads", LOG_INTERVAL_MOVING_MS);
                         g_power_state = POWER_STATE_MOVING;
                         update_power_mode(g_power_state, old_state);
                     }
+                    stationary_time_ms = 0;
+                    current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
+                    // Release position lock so EMA can track the moving position
+                    if (position_locked) {
+                        ESP_LOGI(TAG, "GPS position lock released (motion confirmed)");
+                        position_locked = false;
+                    }
+                    static_lock_ticks = 0;
                 }
-                stationary_time_ms = 0;
-                current_log_interval_ms = LOG_INTERVAL_MOVING_MS;
-                if (g_power_state != POWER_STATE_MOVING) {
-                    power_state_t old_state = g_power_state;
-                    g_power_state = POWER_STATE_MOVING;
-                    update_power_mode(g_power_state, old_state);
-                }
+                // While debouncing, leave stationary_time_ms untouched so a
+                // subsequent static reading can resume accumulating correctly.
             }
+            if (stationary) motion_confirm_count = 0;
             was_stationary = stationary;
-
-            if (!ema_initialized) {
-                ema_lat = gps_data.latitude;
-                ema_lon = gps_data.longitude;
-                ema_alt = gps_data.altitude;
-                ema_initialized = true;
-            } else if (stationary) {
-                ema_lat = GPS_EMA_ALPHA * gps_data.latitude  + (1.0f - GPS_EMA_ALPHA) * ema_lat;
-                ema_lon = GPS_EMA_ALPHA * gps_data.longitude + (1.0f - GPS_EMA_ALPHA) * ema_lon;
-                ema_alt = GPS_EMA_ALPHA * gps_data.altitude  + (1.0f - GPS_EMA_ALPHA) * ema_alt;
-                log_gps.latitude  = ema_lat;
-                log_gps.longitude = ema_lon;
-                log_gps.altitude  = ema_alt;
-            } else {
-                // Moving — snap filter to raw position so tracking stays responsive
-                ema_lat = gps_data.latitude;
-                ema_lon = gps_data.longitude;
-                ema_alt = gps_data.altitude;
-            }
         }
 
         // Log data if GPS is valid
@@ -1496,7 +1930,7 @@ static void gps_logging_task(void *pvParameters)
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             }
             
-            if (log_to_csv(&log_gps, &imu_data) == ESP_OK) {
+            if (log_to_csv(&log_gps, &avg_imu) == ESP_OK) {
                 // ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
                 //          log_gps.latitude, log_gps.longitude,
                 //          log_gps.altitude, log_gps.speed,
@@ -1528,11 +1962,11 @@ static void gps_logging_task(void *pvParameters)
         } else {
             // No GPS fix — log a local-only entry (fix=0) with available IMU data.
             // These rows are written to sync_data.csv but not streamed to peers.
-            if (log_to_csv(&log_gps, &imu_data) != ESP_OK) {
+            if (log_to_csv(&log_gps, &avg_imu) != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to write no-fix log entry");
             }
             ESP_LOGW(TAG, "Waiting for GPS fix... (accel: %.3f, %.3f, %.3f g)",
-                     imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                     avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
             
             // Update LCD showing "No GPS" and IMU data (now fast with dedicated bus!)
             if (lcd_initialized && lcd_display_on) {
@@ -1547,7 +1981,7 @@ static void gps_logging_task(void *pvParameters)
                     // GPS/IMU mode
                     lcd_printf(0, 0, "No GPS Fix");
                     lcd_printf(0, 1, "A:%.2f,%.2f,%.2f", 
-                              imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
+                              avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
                 } else {
                     // Time/IP mode
                     char date_str[17], time_str[17], ip_str[17];
@@ -1559,8 +1993,6 @@ static void gps_logging_task(void *pvParameters)
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(current_log_interval_ms));
-
         // Resync LCD every ~5 seconds to silently fix any nibble misalignment
         if (lcd_initialized && lcd_display_on) {
             lcd_resync_counter++;
@@ -1580,28 +2012,46 @@ static void gps_logging_task(void *pvParameters)
 static void update_power_mode(power_state_t new_state, power_state_t old_state)
 {
     if (new_state == old_state) return;
-    
+
+    const char *from = (old_state == POWER_STATE_MOVING) ? "MOVING" :
+                       (old_state == POWER_STATE_STAGE1) ? "STAGE1" : "STAGE2";
+    const char *to   = (new_state == POWER_STATE_MOVING) ? "MOVING" :
+                       (new_state == POWER_STATE_STAGE1) ? "STAGE1" : "STAGE2";
+
+    ESP_LOGW(TAG, "========================================");
+    ESP_LOGW(TAG, "  POWER STATE: %s  -->  %s", from, to);
+    ESP_LOGW(TAG, "========================================");
+
     switch (new_state) {
         case POWER_STATE_MOVING:
-            // Restore normal power mode
-            if (old_state == POWER_STATE_STAGE2) {
-                ESP_LOGI(TAG, "Exiting low power mode - full operation restored");
-            }
+            ESP_LOGW(TAG, "  Motion detected — full operation restored");
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%.1f s)",
+                     LOG_INTERVAL_MOVING_MS, LOG_INTERVAL_MOVING_MS / 1000.0f);
+            ESP_LOGW(TAG, "  WiFi upload: ENABLED");
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE");
             break;
-            
+
         case POWER_STATE_STAGE1:
-            // Moderate power saving - just reduced logging
-            ESP_LOGI(TAG, "Stage 1 power saving - reduced logging frequency");
+            ESP_LOGW(TAG, "  Static >%lu min — reducing log frequency",
+                     STATIC_STAGE1_THRESHOLD_MS / 60000UL);
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%lu min)",
+                     LOG_INTERVAL_STAGE1_MS, LOG_INTERVAL_STAGE1_MS / 60000UL);
+            ESP_LOGW(TAG, "  WiFi upload: ENABLED");
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE");
             break;
-            
+
         case POWER_STATE_STAGE2:
-            // Aggressive power saving - minimal logging, no uploads
-            ESP_LOGI(TAG, "Stage 2 low power mode - minimal logging, WiFi uploads disabled");
-            ESP_LOGI(TAG, "ESP-NOW sync remains active to respond to peer requests");
-            // Note: WiFi power save (WIFI_PS_MIN_MODEM) is already enabled at init
-            // This mode is compatible with ESP-NOW operation
+            ESP_LOGW(TAG, "  Static >%lu min — entering low power mode",
+                     STATIC_STAGE2_THRESHOLD_MS / 60000UL);
+            ESP_LOGW(TAG, "  Log rate   : %lu ms (%lu min)",
+                     LOG_INTERVAL_STAGE2_MS, LOG_INTERVAL_STAGE2_MS / 60000UL);
+            ESP_LOGW(TAG, "  WiFi upload: PERIODIC (%lu min interval)",
+                     LOG_INTERVAL_STAGE2_MS / 60000UL);
+            ESP_LOGW(TAG, "  ESP-NOW    : ACTIVE (peer sync continues)");
             break;
     }
+
+    ESP_LOGW(TAG, "========================================");
 }
 
 /* ==================== Motion Detection ==================== */
@@ -1705,10 +2155,18 @@ static void sync_state_machine_task(void *pv)
         while (motion_is_static() && search_time < SYNC_SEARCH_TIME_MAX) {
 
             // ── WiFi upload ───────────────────────────────────────────────────
-            // Skip uploads entirely when in Stage 2 (low power mode)
-            if (g_power_state != POWER_STATE_STAGE2) {
+            // Upload in all power states.  In Stage2 use the log-rate interval
+            // (5 min) so data is not lost if the device is never recovered.
+            {
+                int64_t upload_interval_s = (g_power_state == POWER_STATE_STAGE2)
+                                            ? (int64_t)(LOG_INTERVAL_STAGE2_MS / 1000)
+                                            : (int64_t)SYNC_WIFI_UPLOAD_INTERVAL_S;
                 int64_t now_s = esp_timer_get_time() / 1000000LL;
                 if (now_s >= next_wifi_attempt) {
+                    if (g_power_state == POWER_STATE_STAGE2) {
+                        ESP_LOGI(TAG, "[%d] Stage2 periodic upload (every %lld s)...",
+                                 search_time, upload_interval_s);
+                    }
                     // Attempt to connect if not already connected
                     if (!wifi_is_connected()) {
                         ESP_LOGI(TAG, "[%d] WiFi not connected - attempting to connect...", search_time);
@@ -1716,9 +2174,10 @@ static void sync_state_machine_task(void *pv)
                             ESP_LOGW(TAG, "[%d] WiFi connection failed - skipping upload", search_time);
                         }
                     }
-                    
+
                     // Upload if we're now connected
                     if (wifi_is_connected()) {
+<<<<<<< HEAD
                         ESP_LOGI(TAG, "[%d] WiFi up \u2013 uploading sync files...", search_time);
                         wifi_upload_report_t upload_report = { 0 };
                         if (wifi_upload_all_csv(&upload_report)) {
@@ -1741,16 +2200,20 @@ static void sync_state_machine_task(void *pv)
                             }
                         } else {
                             ESP_LOGW(TAG, "Upload failed - preserved pending sync files for retry");
+=======
+                        ESP_LOGI(TAG, "[%d] WiFi up – uploading sync files...", search_time);
+                        if (wifi_upload_all_csv()) {
+                            // wifi_upload_all_csv() manages file lifecycle internally
+                            // (staging + delete on confirmed success).
+                            ESP_LOGI(TAG, "Upload OK");
+                            espnow_sync_reset_peer_states();
+                        } else {
+                            ESP_LOGW(TAG, "Upload failed – will retry");
+>>>>>>> 00fc06937e3e73243f384882384f497b9978a799
                         }
                     }
-                    
-                    next_wifi_attempt = (esp_timer_get_time() / 1000000LL)
-                                        + SYNC_WIFI_UPLOAD_INTERVAL_S;
-                }
-            } else {
-                // In low power mode - skip WiFi uploads  but still respond to ESP-NOW sync
-                if (search_time == 0) {
-                    ESP_LOGI(TAG, "Low power mode active - WiFi uploads disabled");
+
+                    next_wifi_attempt = (esp_timer_get_time() / 1000000LL) + upload_interval_s;
                 }
             }
 
@@ -1880,8 +2343,9 @@ void app_main(void)
     sd_ensure_data_file();
     sd_ensure_merged_file();
     
-    // Initialize GPS UART
+    // Initialize GPS UART and configure module for 5 Hz
     gps_uart_init();
+    gps_configure_5hz();
     
     // Initialize WiFi
     wifi_init_sta();

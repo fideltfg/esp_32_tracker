@@ -309,3 +309,130 @@ bool sd_log_connection(const uint8_t *peer_mac, int records_rx, int records_tx)
     sd_unlock();
     return ok;
 }
+
+// ─── Upload staging helpers ───────────────────────────────────────────────────
+
+// Internal: append all bytes from src_path to dst_path, then delete src_path.
+// Called under sd_lock().
+static void append_and_remove(const char *src_path, const char *dst_path)
+{
+    FILE *src = fopen(src_path, "r");
+    FILE *dst = fopen(dst_path, "a");
+    if (src && dst) {
+        char buf[256];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+            fwrite(buf, 1, n, dst);
+        }
+    }
+    if (src) fclose(src);
+    if (dst) fclose(dst);
+    remove(src_path);
+}
+
+static bool stage_file_for_upload(const char *src, const char *stage)
+{
+    sd_lock();
+
+    struct stat st;
+    bool stage_exists = (stat(stage, &st) == 0 && st.st_size > 0);
+    bool src_exists   = (stat(src,   &st) == 0 && st.st_size > 0);
+
+    if (!stage_exists && !src_exists) {
+        // Nothing to upload
+        sd_unlock();
+        return false;
+    }
+
+    if (!stage_exists) {
+        // Normal happy path: atomically move the live file to the staging slot
+        bool ok = (rename(src, stage) == 0);
+        sd_unlock();
+        if (!ok) ESP_LOGE(TAG, "stage rename %s -> %s failed", src, stage);
+        return ok;
+    }
+
+    // A staging file already exists from a previous failed upload.
+    // Append any new data from the live file into it so it is not lost,
+    // then remove the live file so the GPS task gets a clean slate.
+    if (src_exists) {
+        append_and_remove(src, stage);
+    }
+
+    sd_unlock();
+    return true;
+}
+
+bool sd_stage_data_for_upload(void)
+{
+    return stage_file_for_upload(CSV_DATA_FILE, CSV_UPLOAD_STAGE);
+}
+
+bool sd_stage_merged_for_upload(void)
+{
+    return stage_file_for_upload(CSV_MERGED_FILE, CSV_MERGE_STAGE);
+}
+
+bool sd_delete_upload_stage(void)
+{
+    sd_lock();
+    bool ok = (remove(CSV_UPLOAD_STAGE) == 0);
+    sd_unlock();
+    if (ok) ESP_LOGI(TAG, "Deleted %s", CSV_UPLOAD_STAGE);
+    else    ESP_LOGW(TAG, "Cannot delete %s (may not exist)", CSV_UPLOAD_STAGE);
+    return ok;
+}
+
+bool sd_delete_merge_stage(void)
+{
+    sd_lock();
+    bool ok = (remove(CSV_MERGE_STAGE) == 0);
+    sd_unlock();
+    if (ok) ESP_LOGI(TAG, "Deleted %s", CSV_MERGE_STAGE);
+    else    ESP_LOGW(TAG, "Cannot delete %s (may not exist)", CSV_MERGE_STAGE);
+    return ok;
+}
+
+int sd_read_chunk(const char *path, char *buf, size_t buf_size, long *offset)
+{
+    if (!buf || buf_size < 2 || !offset || !path) return -1;
+
+    sd_lock();
+    FILE *f = fopen(path, "r");
+    if (!f) { sd_unlock(); return 0; } // file absent = EOF
+
+    if (fseek(f, *offset, SEEK_SET) != 0) {
+        fclose(f);
+        sd_unlock();
+        return 0;
+    }
+
+    size_t n = fread(buf, 1, buf_size - 1, f);
+    bool is_eof = feof(f);
+    fclose(f);
+    sd_unlock();
+
+    if (n == 0) return 0; // nothing left to read
+
+    // If we did not reach EOF there is more data in the file.
+    // Truncate our buffer to the last complete line so the CSV parser never
+    // receives a half-written record.
+    if (!is_eof) {
+        size_t last_nl = n;
+        while (last_nl > 0 && buf[last_nl - 1] != '\n') last_nl--;
+        if (last_nl == 0) {
+            // A single record is longer than our buffer — extremely unlikely
+            // with ~80-byte GPS records but handled safely: skip it.
+            ESP_LOGW(TAG, "sd_read_chunk: record exceeds buffer (%zu bytes) at offset %ld — skipping",
+                     buf_size, *offset);
+            *offset += (long)n;
+            buf[0] = '\0';
+            return 0;
+        }
+        n = last_nl;
+    }
+
+    buf[n] = '\0';
+    *offset += (long)n;
+    return (int)n;
+}
