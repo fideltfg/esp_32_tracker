@@ -248,58 +248,22 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         memcpy(ctx->buf + ctx->len, evt->data, copy);
         ctx->len += copy;
         ctx->buf[ctx->len] = '\0';
-<<<<<<< HEAD
-=======
     } else if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
-        // Reset the response buffer at the start of each new connection
-        // (handles redirect chains correctly without clearing data we still need).
+        // Reset the response buffer at the start of each new connection.
         ctx->len = 0;
         if (ctx->buf) ctx->buf[0] = '\0';
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
     }
     return ESP_OK;
 }
 
-// ─── HTTP POST helper ─────────────────────────────────────────────────────────
+// \u2500\u2500\u2500 HTTP POST helper \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // POST a pre-built JSON string to UPLOAD_URL.  Returns true on HTTP 2xx.
 
-<<<<<<< HEAD
-static wifi_upload_result_t upload_file(const char *label, int (*reader)(char *, size_t))
-{
-    const size_t READ_BUF = 32 * 1024;
-    char *csv_buf = malloc(READ_BUF);
-    if (!csv_buf) {
-       // ESP_LOGE(TAG, "OOM allocating read buffer");
-        return WIFI_UPLOAD_FAILED;
-    }
-
-    int csv_len = reader(csv_buf, READ_BUF);
-    if (csv_len <= 0) {
-        //ESP_LOGI(TAG, "%s: nothing to upload", label);
-        free(csv_buf);
-        return WIFI_UPLOAD_NO_DATA;
-    }
-
-    char *json = csv_to_json(csv_buf, csv_len);
-    free(csv_buf);
-    if (!json) {
-        //ESP_LOGI(TAG, "%s: no data rows after CSV\u2192JSON conversion", label);
-        return WIFI_UPLOAD_NO_DATA;
-    }
-
-    ESP_LOGI(TAG, "%s: uploading %d bytes of JSON to %s", label, (int)strlen(json), UPLOAD_URL);
-    ESP_LOGI(TAG, "%s: JSON preview: %.256s", label, json);
-
-    const size_t RESP_BUF = 2048;
-    char *resp_buf = calloc(1, RESP_BUF);
-    if (!resp_buf) { free(json); return WIFI_UPLOAD_FAILED; }
-=======
 static bool http_post_json(const char *label, const char *json)
 {
     const size_t RESP_BUF = 2048;
     char *resp_buf = calloc(1, RESP_BUF);
     if (!resp_buf) return false;
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
 
     resp_ctx_t resp_ctx = { .buf = resp_buf, .len = 0, .cap = RESP_BUF };
 
@@ -318,7 +282,7 @@ static bool http_post_json(const char *label, const char *json)
     if (!client) {
         ESP_LOGE(TAG, "%s: Failed to initialize HTTP client", label);
         free(resp_buf);
-        return WIFI_UPLOAD_FAILED;
+        return false;
     }
 
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -326,17 +290,12 @@ static bool http_post_json(const char *label, const char *json)
     esp_http_client_set_post_field(client, json, (int)strlen(json));
 
     esp_err_t err = esp_http_client_perform(client);
-    wifi_upload_result_t result = WIFI_UPLOAD_FAILED;
+    bool ok = false;
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
-<<<<<<< HEAD
             ESP_LOGI(TAG, "%s: HTTP %d  %s", label, status, resp_buf);
-            result = WIFI_UPLOAD_UPLOADED;
-=======
-            ESP_LOGI(TAG, "%s: HTTP %d — chunk accepted  %s", label, status, resp_buf);
             ok = true;
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
         } else {
             ESP_LOGW(TAG, "%s: server rejected chunk (HTTP %d): %s", label, status, resp_buf);
         }
@@ -350,21 +309,13 @@ static bool http_post_json(const char *label, const char *json)
 
     // Brief pause to let the TCP stack release the socket.
     vTaskDelay(pdMS_TO_TICKS(100));
-<<<<<<< HEAD
-    
-    return result;
-}
-
-wifi_upload_result_t wifi_upload_csv(void)
-=======
     return ok;
 }
 
-// ─── Paged file upload ────────────────────────────────────────────────────────
+// \u2500\u2500\u2500 Paged file upload \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // Reads a staged file in 32 KB pages (aligned to complete CSV lines) and POSTs
-// each page as a separate JSON array.  Returns true only when every page has
-// been confirmed by the server; on any failure the staged file is left intact
-// so the next upload window can retry from the beginning.
+// each page as a separate JSON array.  Returns true only when every page is
+// confirmed by the server; on failure the staged file is preserved for retry.
 
 static bool upload_staged_file(const char *label, const char *filepath)
 {
@@ -380,7 +331,7 @@ static bool upload_staged_file(const char *label, const char *filepath)
 
     while (true) {
         int csv_len = sd_read_chunk(filepath, csv_buf, READ_BUF, &offset);
-        if (csv_len == 0) break;   // clean EOF — all pages sent
+        if (csv_len == 0) break;   // clean EOF
         if (csv_len  < 0) {
             ESP_LOGE(TAG, "%s: read error at offset %ld", label, offset);
             free(csv_buf);
@@ -389,7 +340,7 @@ static bool upload_staged_file(const char *label, const char *filepath)
 
         char *json = csv_to_json(csv_buf, csv_len);
         if (!json) {
-            // No uploadable rows in this page (header-only chunk, etc.) — skip.
+            // No uploadable rows in this chunk (header-only, etc.) -- skip.
             continue;
         }
 
@@ -400,7 +351,7 @@ static bool upload_staged_file(const char *label, const char *filepath)
         free(json);
 
         if (!ok) {
-            // Staged file preserved — will be retried on next upload window.
+            // Staged file preserved -- will be retried on next upload window.
             free(csv_buf);
             return false;
         }
@@ -418,84 +369,65 @@ static bool upload_staged_file(const char *label, const char *filepath)
     return true; // all chunks confirmed (or file was empty)
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// \u2500\u2500\u2500 Public API \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-bool wifi_upload_csv(void)
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
+wifi_upload_result_t wifi_upload_csv(void)
 {
-    if (!sd_stage_data_for_upload()) return true; // nothing to upload
+    if (!sd_stage_data_for_upload()) return WIFI_UPLOAD_NO_DATA;
     sd_ensure_data_file(); // GPS task gets a fresh file immediately
+
     bool ok = upload_staged_file("own-data", CSV_UPLOAD_STAGE);
-    if (ok) sd_delete_upload_stage();
-    return ok;
+    if (ok) {
+        // Rename staged file to backup so data is preserved after confirmed upload.
+        sd_lock();
+        remove(CSV_DATA_BACKUP);
+        if (rename(CSV_UPLOAD_STAGE, CSV_DATA_BACKUP) == 0) {
+            ESP_LOGI(TAG, "own-data: backed up to %s", CSV_DATA_BACKUP);
+        } else {
+            remove(CSV_UPLOAD_STAGE); // fallback: clean up staging file
+        }
+        sd_unlock();
+    }
+    return ok ? WIFI_UPLOAD_UPLOADED : WIFI_UPLOAD_FAILED;
 }
 
 wifi_upload_result_t wifi_upload_merged_csv(void)
 {
-    if (!sd_stage_merged_for_upload()) return true;
+    if (!sd_stage_merged_for_upload()) return WIFI_UPLOAD_NO_DATA;
     sd_ensure_merged_file();
+
     bool ok = upload_staged_file("peer-data", CSV_MERGE_STAGE);
-    if (ok) sd_delete_merge_stage();
-    return ok;
+    if (ok) {
+        sd_lock();
+        remove(CSV_MERGED_BACKUP);
+        if (rename(CSV_MERGE_STAGE, CSV_MERGED_BACKUP) == 0) {
+            ESP_LOGI(TAG, "peer-data: backed up to %s", CSV_MERGED_BACKUP);
+        } else {
+            remove(CSV_MERGE_STAGE);
+        }
+        sd_unlock();
+    }
+    return ok ? WIFI_UPLOAD_UPLOADED : WIFI_UPLOAD_FAILED;
 }
 
 bool wifi_upload_all_csv(wifi_upload_report_t *report)
 {
-<<<<<<< HEAD
     wifi_upload_report_t local_report = {
-        .own_data = WIFI_UPLOAD_NO_DATA,
+        .own_data    = WIFI_UPLOAD_NO_DATA,
         .merged_data = WIFI_UPLOAD_NO_DATA,
     };
 
     local_report.own_data = wifi_upload_csv();
     if (local_report.own_data == WIFI_UPLOAD_FAILED) {
-        ESP_LOGW(TAG, "Own data upload failed – skipping peer upload");
-        if (report) {
-            *report = local_report;
-        }
+        ESP_LOGW(TAG, "Own data upload failed - staging file preserved for retry");
+        if (report) *report = local_report;
         return false;
-=======
-    // ── Stage own data ────────────────────────────────────────────────────────
-    // Atomically rename sync_data.csv → sync_upload.csv so the GPS task can
-    // safely write to a new sync_data.csv while the upload is in progress.
-    bool own_staged = sd_stage_data_for_upload();
-    sd_ensure_data_file(); // create fresh file for GPS task right away
-
-    if (own_staged) {
-        bool own_ok = upload_staged_file("own-data", CSV_UPLOAD_STAGE);
-        if (!own_ok) {
-            ESP_LOGW(TAG, "Own data upload failed – staging file preserved for retry");
-            return false;
-        }
-        sd_delete_upload_stage();
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
     }
 
-    // ── Stage peer (merged) data ──────────────────────────────────────────────
     vTaskDelay(pdMS_TO_TICKS(200));
-<<<<<<< HEAD
-    
+
     local_report.merged_data = wifi_upload_merged_csv();
-    if (report) {
-        *report = local_report;
-    }
+    if (report) *report = local_report;
 
     return local_report.merged_data != WIFI_UPLOAD_FAILED;
-=======
-
-    bool merged_staged = sd_stage_merged_for_upload();
-    sd_ensure_merged_file();
-
-    if (merged_staged) {
-        bool merged_ok = upload_staged_file("peer-data", CSV_MERGE_STAGE);
-        if (merged_ok) {
-            sd_delete_merge_stage();
-        } else {
-            ESP_LOGW(TAG, "Peer data upload failed – staging file preserved for retry");
-            // Non-fatal: own data was already confirmed by the server.
-        }
-    }
-
-    return true; // own data uploaded (or there was none to send)
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
 }

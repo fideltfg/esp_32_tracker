@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ESP32 GPS Logger with IMU
  * 
  * Features:
@@ -2177,39 +2177,26 @@ static void sync_state_machine_task(void *pv)
 
                     // Upload if we're now connected
                     if (wifi_is_connected()) {
-<<<<<<< HEAD
-                        ESP_LOGI(TAG, "[%d] WiFi up \u2013 uploading sync files...", search_time);
+                        ESP_LOGI(TAG, "[%d] WiFi up – uploading sync files...", search_time);
                         wifi_upload_report_t upload_report = { 0 };
                         if (wifi_upload_all_csv(&upload_report)) {
                             bool own_uploaded = (upload_report.own_data == WIFI_UPLOAD_UPLOADED);
                             bool merged_uploaded = (upload_report.merged_data == WIFI_UPLOAD_UPLOADED);
 
                             if (own_uploaded || merged_uploaded) {
-                                ESP_LOGI(TAG, "Upload OK - clearing successfully uploaded sync files");
+                                ESP_LOGI(TAG, "Upload OK – sync files backed up");
                             } else {
                                 ESP_LOGI(TAG, "No new sync rows uploaded");
                             }
 
                             if (own_uploaded) {
-                                sd_backup_data_file();
                                 espnow_sync_reset_own_state();
                             }
                             if (merged_uploaded) {
-                                sd_backup_merged_file();
                                 espnow_sync_reset_merged_state();
                             }
                         } else {
                             ESP_LOGW(TAG, "Upload failed - preserved pending sync files for retry");
-=======
-                        ESP_LOGI(TAG, "[%d] WiFi up – uploading sync files...", search_time);
-                        if (wifi_upload_all_csv()) {
-                            // wifi_upload_all_csv() manages file lifecycle internally
-                            // (staging + delete on confirmed success).
-                            ESP_LOGI(TAG, "Upload OK");
-                            espnow_sync_reset_peer_states();
-                        } else {
-                            ESP_LOGW(TAG, "Upload failed – will retry");
->>>>>>> 00fc06937e3e73243f384882384f497b9978a799
                         }
                     }
 
