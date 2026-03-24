@@ -37,10 +37,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         if (s_retry_count < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_retry_count++;
-           // ESP_LOGI(TAG, "Retry %d/%d ...", s_retry_count, WIFI_MAX_RETRY);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            //ESP_LOGW(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -76,20 +74,21 @@ void wifi_stack_init(void)
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-        s_wifi_event_group = xEventGroupCreate();
-        configASSERT(s_wifi_event_group);
-
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                        ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                        IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
     }
-    // When the tracker already owns the WiFi stack, wifi_is_connected() queries the
-    // driver directly via esp_wifi_sta_get_ap_info(), so no event group is needed.
+
+    // Always create the event group and register this module's event handlers.
+    // wifi_connect() calls xEventGroupClearBits / xEventGroupWaitBits on
+    // s_wifi_event_group regardless of who initialised the WiFi driver, so the
+    // handle must never be NULL when wifi_connect() is called.
+    s_wifi_event_group = xEventGroupCreate();
+    configASSERT(s_wifi_event_group);
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                    ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                    IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     s_initialized = true;
-    //ESP_LOGI(TAG, "WiFi upload module ready (driver %s)", wifi_already_up ? "shared" : "owned");
 }
 
 bool wifi_connect(void)
@@ -120,7 +119,6 @@ void wifi_disconnect(void)
 {
     esp_wifi_disconnect();
     // esp_wifi_stop() is called by the state machine after espnow_deinit()
-   // ESP_LOGI(TAG, "WiFi disconnected");
 }
 
 bool wifi_is_connected(void)
@@ -198,7 +196,6 @@ static char *csv_to_json(const char *csv, int csv_len)
 
         // Guard against buffer overrun
         if (out + 220 >= end) {
-           // ESP_LOGW(TAG, "JSON buffer full, truncating upload");
             break;
         }
 
@@ -371,43 +368,39 @@ static bool upload_staged_file(const char *label, const char *filepath)
 
 // \u2500\u2500\u2500 Public API \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-wifi_upload_result_t wifi_upload_csv(void)
+static wifi_upload_result_t do_csv_upload(
+    const char *label,
+    bool (*stage_fn)(void), bool (*ensure_fn)(void),
+    const char *stage_path, const char *bak_fmt)
 {
-    if (!sd_stage_data_for_upload()) return WIFI_UPLOAD_NO_DATA;
-    sd_ensure_data_file(); // GPS task gets a fresh file immediately
-
-    bool ok = upload_staged_file("own-data", CSV_UPLOAD_STAGE);
+    if (!stage_fn()) return WIFI_UPLOAD_NO_DATA;
+    ensure_fn();
+    bool ok = upload_staged_file(label, stage_path);
     if (ok) {
-        // Rename staged file to backup so data is preserved after confirmed upload.
         sd_lock();
-        remove(CSV_DATA_BACKUP);
-        if (rename(CSV_UPLOAD_STAGE, CSV_DATA_BACKUP) == 0) {
-            ESP_LOGI(TAG, "own-data: backed up to %s", CSV_DATA_BACKUP);
-        } else {
-            remove(CSV_UPLOAD_STAGE); // fallback: clean up staging file
-        }
+        char bak_path[48];
+        int idx = sd_next_bak_index(bak_fmt, bak_path, sizeof(bak_path));
+        if (idx > 0 && rename(stage_path, bak_path) == 0)
+            ESP_LOGI(TAG, "%s: backed up to %s", label, bak_path);
+        else
+            remove(stage_path);
         sd_unlock();
     }
     return ok ? WIFI_UPLOAD_UPLOADED : WIFI_UPLOAD_FAILED;
 }
 
+wifi_upload_result_t wifi_upload_csv(void)
+{
+    return do_csv_upload("own-data",
+                         sd_stage_data_for_upload, sd_ensure_data_file,
+                         CSV_UPLOAD_STAGE, CSV_DATA_BAK_FMT);
+}
+
 wifi_upload_result_t wifi_upload_merged_csv(void)
 {
-    if (!sd_stage_merged_for_upload()) return WIFI_UPLOAD_NO_DATA;
-    sd_ensure_merged_file();
-
-    bool ok = upload_staged_file("peer-data", CSV_MERGE_STAGE);
-    if (ok) {
-        sd_lock();
-        remove(CSV_MERGED_BACKUP);
-        if (rename(CSV_MERGE_STAGE, CSV_MERGED_BACKUP) == 0) {
-            ESP_LOGI(TAG, "peer-data: backed up to %s", CSV_MERGED_BACKUP);
-        } else {
-            remove(CSV_MERGE_STAGE);
-        }
-        sd_unlock();
-    }
-    return ok ? WIFI_UPLOAD_UPLOADED : WIFI_UPLOAD_FAILED;
+    return do_csv_upload("peer-data",
+                         sd_stage_merged_for_upload, sd_ensure_merged_file,
+                         CSV_MERGE_STAGE, CSV_MERGED_BAK_FMT);
 }
 
 bool wifi_upload_all_csv(wifi_upload_report_t *report)

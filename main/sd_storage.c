@@ -95,41 +95,44 @@ void sd_deinit(void)
 
 // ─── CSV file helpers ─────────────────────────────────────────────────────────
 
-bool sd_ensure_data_file(void)
+static bool sd_ensure_file(const char *path)
 {
     sd_lock();
     struct stat st;
-    if (stat(CSV_DATA_FILE, &st) == 0) {
-        sd_unlock();
-        return true; // exists
-    }
-    FILE *f = fopen(CSV_DATA_FILE, "w");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot create %s", CSV_DATA_FILE);
-        sd_unlock();
-        return false;
-    }
+    if (stat(path, &st) == 0) { sd_unlock(); return true; }
+    FILE *f = fopen(path, "w");
+    if (!f) { ESP_LOGE(TAG, "Cannot create %s", path); sd_unlock(); return false; }
     fclose(f);
     sd_unlock();
-    ESP_LOGI(TAG, "Created %s", CSV_DATA_FILE);
+    ESP_LOGI(TAG, "Created %s", path);
     return true;
 }
 
-bool sd_append_record(const char *line)
+static bool sd_append_line(const char *path, const char *line)
 {
     if (!line) return false;
     sd_lock();
-    FILE *f = fopen(CSV_DATA_FILE, "a");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot open %s for append", CSV_DATA_FILE);
-        sd_unlock();
-        return false;
-    }
+    FILE *f = fopen(path, "a");
+    if (!f) { ESP_LOGE(TAG, "Cannot open %s for append", path); sd_unlock(); return false; }
     bool ok = (fputs(line, f) >= 0);
     fclose(f);
     sd_unlock();
     return ok;
 }
+
+static bool sd_delete_file(const char *path)
+{
+    sd_lock();
+    bool ok = (remove(path) == 0);
+    sd_unlock();
+    if (ok) ESP_LOGI(TAG, "Deleted %s", path);
+    else    ESP_LOGE(TAG, "Cannot delete %s", path);
+    return ok;
+}
+
+bool sd_ensure_data_file(void)          { return sd_ensure_file(CSV_DATA_FILE); }
+
+bool sd_append_record(const char *line)   { return sd_append_line(CSV_DATA_FILE, line); }
 
 int sd_record_count(void)
 {
@@ -149,70 +152,44 @@ int sd_record_count(void)
     return count;
 }
 
-bool sd_delete_data_file(void)
+bool sd_delete_data_file(void)            { return sd_delete_file(CSV_DATA_FILE); }
+
+int sd_next_bak_index(const char *fmt, char *out_path, size_t out_size)
 {
-    sd_lock();
-    bool ok = (remove(CSV_DATA_FILE) == 0);
-    sd_unlock();
-    if (ok) ESP_LOGI(TAG, "Deleted %s", CSV_DATA_FILE);
-    else    ESP_LOGE(TAG, "Cannot delete %s", CSV_DATA_FILE);
-    return ok;
+    struct stat st;
+    for (int i = 1; i <= 999; i++) {
+        snprintf(out_path, out_size, fmt, i);
+        if (stat(out_path, &st) != 0) return i;
+    }
+    return -1;
 }
 
-bool sd_backup_data_file(void)
+static bool sd_backup_file(const char *path, const char *bak_fmt)
 {
+    char bak_path[48];
     sd_lock();
-    // Remove any previous backup so rename cannot fail with EEXIST.
-    remove(CSV_DATA_BACKUP);
-    bool ok = (rename(CSV_DATA_FILE, CSV_DATA_BACKUP) == 0);
-    if (!ok) {
-        ESP_LOGE(TAG, "Cannot rename %s -> %s", CSV_DATA_FILE, CSV_DATA_BACKUP);
+    int idx = sd_next_bak_index(bak_fmt, bak_path, sizeof(bak_path));
+    if (idx < 0) { ESP_LOGE(TAG, "No free backup slot for %s", path); sd_unlock(); return false; }
+    if (rename(path, bak_path) != 0) {
+        ESP_LOGE(TAG, "Cannot rename %s -> %s", path, bak_path);
         sd_unlock();
         return false;
     }
-    ESP_LOGI(TAG, "Backed up %s -> %s", CSV_DATA_FILE, CSV_DATA_BACKUP);
-    // Create a fresh empty file ready for new records.
-    FILE *f = fopen(CSV_DATA_FILE, "w");
+    ESP_LOGI(TAG, "Backed up %s -> %s", path, bak_path);
+    FILE *f = fopen(path, "w");
     if (f) fclose(f);
-    ESP_LOGI(TAG, "Created fresh %s", CSV_DATA_FILE);
+    ESP_LOGI(TAG, "Created fresh %s", path);
     sd_unlock();
     return true;
 }
+
+bool sd_backup_data_file(void)            { return sd_backup_file(CSV_DATA_FILE, CSV_DATA_BAK_FMT); }
 
 // ─── Peer-data (merged) file ──────────────────────────────────────────────────
 
-bool sd_ensure_merged_file(void)
-{
-    sd_lock();
-    struct stat st;
-    if (stat(CSV_MERGED_FILE, &st) == 0) { sd_unlock(); return true; }
-    FILE *f = fopen(CSV_MERGED_FILE, "w");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot create %s", CSV_MERGED_FILE);
-        sd_unlock();
-        return false;
-    }
-    fclose(f);
-    sd_unlock();
-    ESP_LOGI(TAG, "Created %s", CSV_MERGED_FILE);
-    return true;
-}
+bool sd_ensure_merged_file(void)          { return sd_ensure_file(CSV_MERGED_FILE); }
 
-bool sd_append_merged_record(const char *line)
-{
-    if (!line) return false;
-    sd_lock();
-    FILE *f = fopen(CSV_MERGED_FILE, "a");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot open %s for append", CSV_MERGED_FILE);
-        sd_unlock();
-        return false;
-    }
-    bool ok = (fputs(line, f) >= 0);
-    fclose(f);
-    sd_unlock();
-    return ok;
-}
+bool sd_append_merged_record(const char *line) { return sd_append_line(CSV_MERGED_FILE, line); }
 
 int sd_read_merged(char *buf, size_t buf_size)
 {
@@ -230,33 +207,9 @@ int sd_read_merged(char *buf, size_t buf_size)
     return (int)n;
 }
 
-bool sd_delete_merged_file(void)
-{
-    sd_lock();
-    bool ok = (remove(CSV_MERGED_FILE) == 0);
-    sd_unlock();
-    if (ok) ESP_LOGI(TAG, "Deleted %s", CSV_MERGED_FILE);
-    else    ESP_LOGE(TAG, "Cannot delete %s", CSV_MERGED_FILE);
-    return ok;
-}
+bool sd_delete_merged_file(void)          { return sd_delete_file(CSV_MERGED_FILE); }
 
-bool sd_backup_merged_file(void)
-{
-    sd_lock();
-    remove(CSV_MERGED_BACKUP);
-    bool ok = (rename(CSV_MERGED_FILE, CSV_MERGED_BACKUP) == 0);
-    if (!ok) {
-        ESP_LOGE(TAG, "Cannot rename %s -> %s", CSV_MERGED_FILE, CSV_MERGED_BACKUP);
-        sd_unlock();
-        return false;
-    }
-    ESP_LOGI(TAG, "Backed up %s -> %s", CSV_MERGED_FILE, CSV_MERGED_BACKUP);
-    FILE *f = fopen(CSV_MERGED_FILE, "w");
-    if (f) fclose(f);
-    ESP_LOGI(TAG, "Created fresh %s", CSV_MERGED_FILE);
-    sd_unlock();
-    return true;
-}
+bool sd_backup_merged_file(void)          { return sd_backup_file(CSV_MERGED_FILE, CSV_MERGED_BAK_FMT); }
 
 int sd_read_all(char *buf, size_t buf_size)
 {

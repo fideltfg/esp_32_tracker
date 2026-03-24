@@ -18,6 +18,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -141,7 +142,8 @@ static const char* get_timezone_from_gps(float latitude, float longitude)
             return "MST7";
 
         // General longitude bands — all observe DST
-        if (longitude < -114.0f) return "PST8PDT,M3.2.0,M11.1.0";  // Pacific
+        // -120° aligns with the BC/Alberta border; -102° with the AB/SK border
+        if (longitude < -120.0f) return "PST8PDT,M3.2.0,M11.1.0";  // Pacific
         if (longitude < -102.0f) return "MST7MDT,M3.2.0,M11.1.0";  // Mountain
         if (longitude <  -82.0f) return "CST6CDT,M3.2.0,M11.1.0";  // Central
         return "EST5EDT,M3.2.0/2,M11.1.0";                          // Eastern
@@ -454,7 +456,6 @@ static esp_err_t lcd_init(void)
             if (ret == ESP_OK) {
                 lcd_actual_addr = addresses[i];
                 found = true;
-               // ESP_LOGI(TAG, "LCD1602A found at address 0x%02X", addresses[i]);
             }
             break;
         }
@@ -1520,16 +1521,29 @@ static esp_err_t http_get_handler(httpd_req_t *req)
 
     // ── Backup files (kept after successful upload for verification) ───────────
     httpd_resp_sendstr_chunk(req, "<h2>Backup Files</h2><table>");
-    http_emit_file_row(req, "sync_data.bak",   CSV_DATA_BACKUP);
-    http_emit_file_row(req, "sync_merged.bak", CSV_MERGED_BACKUP);
+    {
+        DIR *d = opendir(SD_MOUNT_POINT);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                size_t len = strlen(ent->d_name);
+                if (len > 4 && strcmp(ent->d_name + len - 4, ".bak") == 0) {
+                    char full[272]; /* /sdcard/ (8) + 255-char name + NUL */
+                    snprintf(full, sizeof(full), SD_MOUNT_POINT "/%s", ent->d_name);
+                    http_emit_file_row(req, ent->d_name, full);
+                }
+            }
+            closedir(d);
+        }
+    }
     httpd_resp_sendstr_chunk(req, "</table>");
 
-    // \u2500\u2500 Connection log \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    
     httpd_resp_sendstr_chunk(req, "<h2>Connection Log</h2><table>");
     http_emit_file_row(req, "connections.csv", CONNECTIONS_LOG_FILE);
     httpd_resp_sendstr_chunk(req, "</table>");
 
-    // \u2500\u2500 Clear all data \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    
     httpd_resp_sendstr_chunk(req,
         "<h2>Actions</h2>"
         "<form method='POST' action='/clear' "
@@ -1678,6 +1692,32 @@ static httpd_handle_t start_webserver(void)
 // Forward declaration for power management function
 static void update_power_mode(power_state_t new_state, power_state_t old_state);
 
+static void lcd_update_display(uint8_t *last_mode, const gps_data_t *gps,
+                                const imu_data_t *imu, bool has_fix)
+{
+    if (!lcd_initialized || !lcd_display_on) return;
+    if (display_mode != *last_mode) {
+        lcd_clear();
+        *last_mode = display_mode;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (display_mode == 0) {
+        if (has_fix) {
+            lcd_printf(0, 0, "%.1fkm %.1fm", gps->speed, gps->altitude);
+            lcd_printf(0, 1, "%.4f,%.4f", gps->latitude, gps->longitude);
+        } else {
+            lcd_printf(0, 0, "No GPS Fix");
+            lcd_printf(0, 1, "A:%.2f,%.2f,%.2f", imu->accel_x, imu->accel_y, imu->accel_z);
+        }
+    } else {
+        char date_str[17], time_str[17], ip_str[17];
+        get_datetime_string(date_str, time_str, sizeof(date_str));
+        get_ip_string(ip_str, sizeof(ip_str));
+        lcd_printf(0, 0, "%s", time_str);
+        lcd_printf(0, 1, "%s", ip_str);
+    }
+}
+
 static void gps_logging_task(void *pvParameters)
 {
     uint8_t *data = (uint8_t *) malloc(UART_BUF_SIZE);
@@ -1746,11 +1786,8 @@ static void gps_logging_task(void *pvParameters)
                         
                         // Parse NMEA sentences
                         if (strncmp(line_buffer, "$GPRMC", 6) == 0) {
-                            bool was_valid = gps_data.valid;
                             parse_gprmc(line_buffer, &gps_data);
-                            // A new valid fix has arrived when status flips to A
                             if (gps_data.valid) gps_fix_updated = true;
-                            (void)was_valid;
                         } else if (strncmp(line_buffer, "$GPGGA", 6) == 0) {
                             parse_gpgga(line_buffer, &gps_data);
                         }
@@ -2065,35 +2102,8 @@ static void gps_logging_task(void *pvParameters)
                 }
             }
             
-            if (log_to_csv(&log_gps, &avg_imu) == ESP_OK) {
-                // ESP_LOGI(TAG, "Logged: %.6f, %.6f, %.1f m, %.1f km/h, accel: %.3f, %.3f, %.3f g",
-                //          log_gps.latitude, log_gps.longitude,
-                //          log_gps.altitude, log_gps.speed,
-                //          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z);
-            }
-            
-            // Update LCD with GPS data (now fast with dedicated bus!)
-            if (lcd_initialized && lcd_display_on) {
-                // Clear display if mode changed
-                if (display_mode != last_display_mode) {
-                    lcd_clear();
-                    last_display_mode = display_mode;
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                }
-                
-                if (display_mode == 0) {
-                    // GPS/IMU mode
-                    lcd_printf(0, 0, "%.1fkm %.1fm", log_gps.speed, log_gps.altitude);
-                    lcd_printf(0, 1, "%.4f,%.4f", log_gps.latitude, log_gps.longitude);
-                } else {
-                    // Time/IP mode
-                    char date_str[17], time_str[17], ip_str[17];
-                    get_datetime_string(date_str, time_str, sizeof(date_str));
-                    get_ip_string(ip_str, sizeof(ip_str));
-                    lcd_printf(0, 0, "%s", time_str);
-                    lcd_printf(0, 1, "%s", ip_str);
-                }
-            }
+            log_to_csv(&log_gps, &avg_imu);
+            lcd_update_display(&last_display_mode, &log_gps, &avg_imu, true);
         } else {
             // No GPS fix — log a local-only entry (fix=0) with available IMU data.
             // These rows are written to sync_data.csv but not streamed to peers.
@@ -2102,30 +2112,7 @@ static void gps_logging_task(void *pvParameters)
             }
             ESP_LOGW(TAG, "Waiting for GPS fix... (accel: %.3f, %.3f, %.3f g)",
                      avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
-            
-            // Update LCD showing "No GPS" and IMU data (now fast with dedicated bus!)
-            if (lcd_initialized && lcd_display_on) {
-                // Clear display if mode changed
-                if (display_mode != last_display_mode) {
-                    lcd_clear();
-                    last_display_mode = display_mode;
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                }
-                
-                if (display_mode == 0) {
-                    // GPS/IMU mode
-                    lcd_printf(0, 0, "No GPS Fix");
-                    lcd_printf(0, 1, "A:%.2f,%.2f,%.2f", 
-                              avg_imu.accel_x, avg_imu.accel_y, avg_imu.accel_z);
-                } else {
-                    // Time/IP mode
-                    char date_str[17], time_str[17], ip_str[17];
-                    get_datetime_string(date_str, time_str, sizeof(date_str));
-                    get_ip_string(ip_str, sizeof(ip_str));
-                    lcd_printf(0, 0, "%s", time_str);
-                    lcd_printf(0, 1, "%s", ip_str);
-                }
-            }
+            lcd_update_display(&last_display_mode, &log_gps, &avg_imu, false);
         }
         
         // Resync LCD every ~5 seconds to silently fix any nibble misalignment

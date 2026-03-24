@@ -63,8 +63,17 @@ int  sd_record_count(void);
 bool sd_delete_data_file(void);
 
 /**
- * @brief Rename CSV_DATA_FILE to CSV_DATA_BACKUP, then create a fresh
- *        CSV_DATA_FILE.  Any previous backup is overwritten.
+ * @brief Find the next unused sequential backup path.
+ *        fmt must contain exactly one %d (e.g. CSV_DATA_BAK_FMT).
+ *        Writes the resulting path into out_path.
+ * @return The index used (1–999), or -1 if all slots are taken.
+ */
+int sd_next_bak_index(const char *fmt, char *out_path, size_t out_size);
+
+/**
+ * @brief Rename CSV_DATA_FILE to the next sequential backup name
+ *        (e.g. sync_data_001.bak, sync_data_002.bak …), then create
+ *        a fresh CSV_DATA_FILE ready for new records.
  * @return true on success.
  */
 bool sd_backup_data_file(void);
@@ -94,8 +103,9 @@ int  sd_read_merged(char *buf, size_t buf_size);
 bool sd_delete_merged_file(void);
 
 /**
- * @brief Rename CSV_MERGED_FILE to CSV_MERGED_BACKUP, then create a fresh
- *        CSV_MERGED_FILE.  Any previous backup is overwritten.
+ * @brief Rename CSV_MERGED_FILE to the next sequential backup name
+ *        (e.g. sync_merged_001.bak, sync_merged_002.bak …), then create
+ *        a fresh CSV_MERGED_FILE ready for new records.
  * @return true on success.
  */
 bool sd_backup_merged_file(void);

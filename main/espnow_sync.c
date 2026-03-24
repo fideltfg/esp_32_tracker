@@ -264,7 +264,6 @@ static int receive_and_merge_from_peer(const uint8_t *peer_mac)
         if (memcmp(item.src_mac, peer_mac, 6) != 0) continue;
 
         if (item.frame.type == MSG_DONE) {
-           // ESP_LOGI(TAG, "Received DONE from " MACSTR, MAC2STR(peer_mac));
             got_done = true;
             break;
         }
@@ -285,7 +284,6 @@ static int receive_and_merge_from_peer(const uint8_t *peer_mac)
     fclose(tmp);
 
     if (!got_done && bytes_written == 0) {
-       // ESP_LOGW(TAG, "No data received from " MACSTR " (timeout)", MAC2STR(peer_mac));
         remove(CSV_MERGE_TMP);
         return 0;
     }
@@ -339,7 +337,6 @@ bool espnow_init(void)
         ESP_ERROR_CHECK(esp_now_add_peer(&bcast_peer));
     }
 
-   // ESP_LOGI(TAG, "ESP-NOW initialised");
     return true;
 }
 
@@ -361,7 +358,6 @@ void espnow_deinit(void)
 void espnow_sync_reset_peer_states(void)
 {
     s_peer_state_count = 0;
-    //ESP_LOGI(TAG, "Per-peer sync state cleared");
 }
 
 void espnow_sync_reset_own_state(void)
