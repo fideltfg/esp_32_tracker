@@ -371,19 +371,29 @@ static bool upload_staged_file(const char *label, const char *filepath)
 static wifi_upload_result_t do_csv_upload(
     const char *label,
     bool (*stage_fn)(void), bool (*ensure_fn)(void),
-    const char *stage_path, const char *bak_fmt)
+    const char *stage_path, const char *bak_path)
 {
     if (!stage_fn()) return WIFI_UPLOAD_NO_DATA;
     ensure_fn();
     bool ok = upload_staged_file(label, stage_path);
     if (ok) {
+        // Append the staged file's contents to the single accumulating .bak
+        // archive, then remove the staged file.
         sd_lock();
-        char bak_path[48];
-        int idx = sd_next_bak_index(bak_fmt, bak_path, sizeof(bak_path));
-        if (idx > 0 && rename(stage_path, bak_path) == 0)
-            ESP_LOGI(TAG, "%s: backed up to %s", label, bak_path);
-        else
-            remove(stage_path);
+        FILE *fsrc = fopen(stage_path, "r");
+        FILE *fdst = fsrc ? fopen(bak_path, "a") : NULL;
+        if (fsrc && fdst) {
+            char iobuf[512];
+            size_t n;
+            while ((n = fread(iobuf, 1, sizeof(iobuf), fsrc)) > 0)
+                fwrite(iobuf, 1, n, fdst);
+            ESP_LOGI(TAG, "%s: appended to %s", label, bak_path);
+        } else {
+            ESP_LOGW(TAG, "%s: could not open files for archive copy", label);
+        }
+        if (fdst)  fclose(fdst);
+        if (fsrc)  fclose(fsrc);
+        remove(stage_path);
         sd_unlock();
     }
     return ok ? WIFI_UPLOAD_UPLOADED : WIFI_UPLOAD_FAILED;
@@ -393,14 +403,14 @@ wifi_upload_result_t wifi_upload_csv(void)
 {
     return do_csv_upload("own-data",
                          sd_stage_data_for_upload, sd_ensure_data_file,
-                         CSV_UPLOAD_STAGE, CSV_DATA_BAK_FMT);
+                         CSV_UPLOAD_STAGE, CSV_DATA_BAK);
 }
 
 wifi_upload_result_t wifi_upload_merged_csv(void)
 {
     return do_csv_upload("peer-data",
                          sd_stage_merged_for_upload, sd_ensure_merged_file,
-                         CSV_MERGE_STAGE, CSV_MERGED_BAK_FMT);
+                         CSV_MERGE_STAGE, CSV_MERGED_BAK);
 }
 
 bool wifi_upload_all_csv(wifi_upload_report_t *report)
