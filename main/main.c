@@ -54,6 +54,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "GPS_LOGGER";
 static int s_retry_num = 0;
 static bool time_synced = false;
+static bool time_set_from_rtc = false;  // RTC successfully set system time on boot
 static bool timezone_set_from_gps = false;
 static sdmmc_card_t *card = NULL;
 static httpd_handle_t server = NULL;
@@ -71,6 +72,8 @@ typedef struct {
     float hdop;    // horizontal dilution of precision (from GPGGA)
     int   num_sv;  // satellites in use (from GPGGA)
     bool valid;
+    struct tm gps_utc_time;  // UTC date+time parsed from GPRMC (fields 1 and 9)
+    bool   gps_time_valid;  // true once a complete date+time has been parsed
 } gps_data_t;
 
 // IMU Data Structure
@@ -101,57 +104,124 @@ static volatile power_state_t g_power_state = POWER_STATE_MOVING;
 
 static const char* get_timezone_from_gps(float latitude, float longitude)
 {
-    // Rough timezone detection based on longitude and latitude
-    // Note: This is approximate - real timezone boundaries are political/geographical
-    
-    // Calculate approximate UTC offset from longitude (15 degrees = 1 hour)
-    int utc_offset = (int)((longitude + 7.5) / 15.0);
-    
-    // Clamp offset to valid range
-    if (utc_offset > 12) utc_offset = 12;
-    if (utc_offset < -12) utc_offset = -12;
-    
-    // Special cases for regions with known timezones
-    
-    // United States (continental)
-    if (latitude >= 24.0 && latitude <= 49.0 && longitude >= -125.0 && longitude <= -66.0) {
-        if (longitude >= -125.0 && longitude < -120.0) return "PST8PDT,M3.2.0,M11.1.0"; // Pacific
-        if (longitude >= -120.0 && longitude < -105.0) return "MST7MDT,M3.2.0,M11.1.0"; // Mountain
-        if (longitude >= -105.0 && longitude < -90.0) return "CST6CDT,M3.2.0,M11.1.0";  // Central
-        if (longitude >= -90.0 && longitude <= -66.0) return "EST5EDT,M3.2.0/2,M11.1.0"; // Eastern
+    // Comprehensive timezone detection from GPS coordinates.
+    // Political exceptions are tested before generic longitude bands so that
+    // regions that do not observe DST (Saskatchewan, Yukon, Hawaii, etc.) are
+    // handled correctly even when they share a longitude with DST-observing zones.
+
+    // ── North America (lat 14–83 N, lon -168 to -52) ─────────────────────────
+    if (latitude >= 14.0f && latitude <= 83.0f &&
+        longitude >= -168.0f && longitude <= -52.0f) {
+
+        // Hawaii — UTC-10, no DST
+        if (latitude >= 18.0f && latitude <= 23.0f &&
+            longitude >= -162.0f && longitude <= -154.0f)
+            return "HST10";
+
+        // Alaska — UTC-9, observes DST
+        if (latitude >= 54.0f && longitude <= -130.0f)
+            return "AKST9AKDT,M3.2.0,M11.1.0";
+
+        // Newfoundland — UTC-3:30, observes DST
+        if (latitude >= 46.0f && longitude >= -59.0f)
+            return "NST3:30NDT,M3.2.0/0:01,M11.1.0/0:01";
+
+        // Atlantic Canada (NB, NS, PEI, eastern QC) — UTC-4, observes DST
+        if (latitude >= 43.0f && latitude <= 52.0f &&
+            longitude >= -66.0f && longitude <= -59.0f)
+            return "AST4ADT,M3.2.0,M11.1.0";
+
+        // Saskatchewan — permanent CST (UTC-6), no DST
+        if (latitude >= 49.0f && latitude <= 60.0f &&
+            longitude >= -110.0f && longitude <= -101.0f)
+            return "CST6";
+
+        // Yukon — permanent MST (UTC-7), no DST since 2020
+        if (latitude >= 60.0f && longitude <= -124.0f)
+            return "MST7";
+
+        // General longitude bands — all observe DST
+        if (longitude < -114.0f) return "PST8PDT,M3.2.0,M11.1.0";  // Pacific
+        if (longitude < -102.0f) return "MST7MDT,M3.2.0,M11.1.0";  // Mountain
+        if (longitude <  -82.0f) return "CST6CDT,M3.2.0,M11.1.0";  // Central
+        return "EST5EDT,M3.2.0/2,M11.1.0";                          // Eastern
     }
-    
-    // Australia
-    if (latitude >= -44.0 && latitude <= -10.0 && longitude >= 113.0 && longitude <= 154.0) {
-        if (longitude >= 113.0 && longitude < 129.0) return "AWST-8";  // Western
-        if (longitude >= 129.0 && longitude < 138.0) return "ACST-9:30ACDT,M10.1.0,M4.1.0/3"; // Central
-        if (longitude >= 138.0 && longitude <= 154.0) return "AEST-10AEDT,M10.1.0,M4.1.0/3"; // Eastern
+
+    // ── Australia ─────────────────────────────────────────────────────────────
+    if (latitude >= -44.0f && latitude <= -10.0f &&
+        longitude >= 113.0f && longitude <= 167.0f) {
+        // Lord Howe Island — UTC+10:30/+11, half-hour DST
+        if (longitude >= 159.0f)
+            return "LHST-10:30LHDT-11,M10.1.0,M4.1.0";
+        if (longitude < 129.0f) return "AWST-8";                           // Western
+        if (longitude < 138.0f) return "ACST-9:30ACDT,M10.1.0,M4.1.0/3"; // Central
+        return "AEST-10AEDT,M10.1.0,M4.1.0/3";                            // Eastern
     }
-    
-    // Europe
-    if (latitude >= 35.0 && latitude <= 71.0 && longitude >= -10.0 && longitude <= 40.0) {
-        if (longitude >= -10.0 && longitude < 7.5) return "GMT0BST,M3.5.0/1,M10.5.0"; // UK/Western
-        if (longitude >= 7.5 && longitude < 22.5) return "CET-1CEST,M3.5.0,M10.5.0/3"; // Central
-        if (longitude >= 22.5 && longitude <= 40.0) return "EET-2EEST,M3.5.0/3,M10.5.0/4"; // Eastern
+
+    // ── New Zealand — UTC+12, observes DST ───────────────────────────────────
+    if (latitude >= -48.0f && latitude <= -34.0f &&
+        longitude >= 165.0f && longitude <= 178.5f)
+        return "NZST-12NZDT,M9.5.0,M4.1.0/3";
+
+    // ── Europe: Iceland / Azores — UTC+0, NO DST (checked before main block) ─
+    if (latitude >= 35.0f && latitude <= 71.0f &&
+        longitude >= -28.0f && longitude < -15.0f)
+        return "GMT0";
+
+    // ── Europe ────────────────────────────────────────────────────────────────
+    if (latitude >= 35.0f && latitude <= 71.0f &&
+        longitude >= -15.0f && longitude <= 40.0f) {
+        if (longitude <  7.5f) return "GMT0BST,M3.5.0/1,M10.5.0";   // UK / W. Europe / Portugal
+        if (longitude < 22.5f) return "CET-1CEST,M3.5.0,M10.5.0/3"; // Central Europe
+        return "EET-2EEST,M3.5.0/3,M10.5.0/4";                       // Eastern Europe
     }
-    
-    // Japan
-    if (latitude >= 24.0 && latitude <= 46.0 && longitude >= 123.0 && longitude <= 146.0) {
-        return "JST-9";
-    }
-    
-    // China
-    if (latitude >= 18.0 && latitude <= 54.0 && longitude >= 73.0 && longitude <= 135.0) {
-        return "CST-8";
-    }
-    
-    // India
-    if (latitude >= 8.0 && latitude <= 35.0 && longitude >= 68.0 && longitude <= 97.0) {
+
+    // ── Israel / Palestine — UTC+2, observes DST ─────────────────────────────
+    if (latitude >= 29.0f && latitude <= 34.0f &&
+        longitude >= 34.0f && longitude <= 36.5f)
+        return "IST-2IDT,M3.4.4/26,M10.5.0";
+
+    // ── Gulf Standard Time — UTC+4, no DST ───────────────────────────────────
+    if (latitude >= 12.0f && latitude <= 30.0f &&
+        longitude >= 44.0f && longitude <= 60.0f)
+        return "GST-4";
+
+    // ── India — UTC+5:30, no DST ──────────────────────────────────────────────
+    if (latitude >= 8.0f && latitude <= 37.0f &&
+        longitude >= 68.0f && longitude <= 97.0f)
         return "IST-5:30";
-    }
-    
-    // Generic UTC offset based on longitude as fallback
-    static char tz_buf[32];
+
+    // ── China — UTC+8, no DST ────────────────────────────────────────────────
+    if (latitude >= 18.0f && latitude <= 54.0f &&
+        longitude >= 73.0f && longitude <= 135.0f)
+        return "CST-8";
+
+    // ── Japan — UTC+9, no DST ────────────────────────────────────────────────
+    if (latitude >= 24.0f && latitude <= 46.0f &&
+        longitude >= 123.0f && longitude <= 146.0f)
+        return "JST-9";
+
+    // ── South Africa — UTC+2, no DST ─────────────────────────────────────────
+    if (latitude >= -35.0f && latitude <= -22.0f &&
+        longitude >= 16.0f && longitude <= 33.0f)
+        return "SAST-2";
+
+    // ── Argentina — UTC-3, no DST ────────────────────────────────────────────
+    if (latitude >= -55.0f && latitude <= -22.0f &&
+        longitude >= -73.0f && longitude <= -53.0f)
+        return "ART3";
+
+    // ── Brazil East (São Paulo / Rio / Brasília) — UTC-3, no DST ─────────────
+    if (latitude >= -34.0f && latitude <= 5.0f &&
+        longitude >= -46.0f && longitude <= -35.0f)
+        return "BRT3";
+
+    // ── Generic fallback: UTC offset derived from longitude ───────────────────
+    // 15° per hour; bias +7.5° so mid-zone rounds correctly.
+    int utc_offset = (int)((longitude + 7.5f) / 15.0f);
+    if (utc_offset >  14) utc_offset =  14;
+    if (utc_offset < -12) utc_offset = -12;
+    static char tz_buf[16];
     if (utc_offset == 0) {
         return "UTC0";
     } else if (utc_offset > 0) {
@@ -847,23 +917,30 @@ static esp_err_t mpu6050_calibrate(void)
 
 static bool parse_gprmc(const char *nmea, gps_data_t *gps_data)
 {
-    // $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+    // $GPRMC,HHMMSS,A,DDMM.mm,N,DDDMM.mm,E,SSS.S,CCC.C,DDMMYY,MAG,VAR*hh
+    //  [0]   [1]   [2] [3]   [4] [5]    [6] [7]  [8]   [9]
     char *token;
     char nmea_copy[128];
     strncpy(nmea_copy, nmea, sizeof(nmea_copy) - 1);
-    
+    nmea_copy[sizeof(nmea_copy) - 1] = '\0';
+
     token = strtok(nmea_copy, ",");
     if (!token || strcmp(token, "$GPRMC") != 0) return false;
-    
-    token = strtok(NULL, ","); // Time
-    token = strtok(NULL, ","); // Status
+
+    // Field [1]: UTC time  HHMMSS(.ss) — save for date+time struct below
+    char time_str[16] = {0};
+    token = strtok(NULL, ",");
+    if (token) strncpy(time_str, token, sizeof(time_str) - 1);
+
+    // Field [2]: Status A=valid, V=warning
+    token = strtok(NULL, ",");
     if (!token || token[0] != 'A') {
         gps_data->valid = false;
         return false;
     }
-    
+
     gps_data->valid = true;
-    
+
     // Latitude
     token = strtok(NULL, ",");
     if (token) {
@@ -871,11 +948,11 @@ static bool parse_gprmc(const char *nmea, gps_data_t *gps_data)
         int lat_deg = (int)(lat_raw / 100);
         float lat_min = lat_raw - (lat_deg * 100);
         gps_data->latitude = lat_deg + (lat_min / 60.0f);
-        
+
         token = strtok(NULL, ","); // N/S
         if (token && token[0] == 'S') gps_data->latitude = -gps_data->latitude;
     }
-    
+
     // Longitude
     token = strtok(NULL, ",");
     if (token) {
@@ -883,17 +960,37 @@ static bool parse_gprmc(const char *nmea, gps_data_t *gps_data)
         int lon_deg = (int)(lon_raw / 100);
         float lon_min = lon_raw - (lon_deg * 100);
         gps_data->longitude = lon_deg + (lon_min / 60.0f);
-        
+
         token = strtok(NULL, ","); // E/W
         if (token && token[0] == 'W') gps_data->longitude = -gps_data->longitude;
     }
-    
-    // Speed in knots
+
+    // Field [7]: Speed in knots → km/h
     token = strtok(NULL, ",");
     if (token) {
-        gps_data->speed = atof(token) * 1.852f; // Convert knots to km/h
+        gps_data->speed = atof(token) * 1.852f;
     }
-    
+
+    // Field [8]: Course over ground (skip)
+    token = strtok(NULL, ",");
+
+    // Field [9]: Date  DDMMYY — combine with saved time_str to build UTC struct tm
+    token = strtok(NULL, ",");
+    if (token && strlen(token) >= 6 && strlen(time_str) >= 6) {
+        struct tm t = {0};
+        t.tm_hour = (time_str[0] - '0') * 10 + (time_str[1] - '0');
+        t.tm_min  = (time_str[2] - '0') * 10 + (time_str[3] - '0');
+        t.tm_sec  = (time_str[4] - '0') * 10 + (time_str[5] - '0');
+        t.tm_mday = (token[0] - '0') * 10 + (token[1] - '0');
+        int mon   = (token[2] - '0') * 10 + (token[3] - '0');  // 1–12
+        int yy    = (token[4] - '0') * 10 + (token[5] - '0');  // 0–99
+        t.tm_mon  = mon - 1;                 // struct tm: 0 = January
+        t.tm_year = (yy < 70 ? 2000 : 1900) + yy - 1900; // years since 1900
+        t.tm_isdst = 0;                      // GPS always provides UTC
+        gps_data->gps_utc_time  = t;
+        gps_data->gps_time_valid = true;
+    }
+
     return true;
 }
 
@@ -1331,6 +1428,25 @@ static void wifi_init_sta(void)
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
     }
+}
+
+/* ==================== Portable timegm ==================== */
+// Converts a UTC struct tm to time_t without relying on the non-standard timegm().
+// Temporarily overrides TZ to UTC0 so mktime() treats the struct as UTC.
+static time_t portable_timegm(struct tm *utc_tm)
+{
+    char saved_tz[64] = {0};
+    const char *cur = getenv("TZ");
+    if (cur) strncpy(saved_tz, cur, sizeof(saved_tz) - 1);
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    struct tm tmp = *utc_tm;
+    tmp.tm_isdst = 0;
+    time_t result = mktime(&tmp);
+    if (saved_tz[0]) setenv("TZ", saved_tz, 1);
+    else             unsetenv("TZ");
+    tzset();
+    return result;
 }
 
 /* ==================== SNTP Functions ==================== */
@@ -1919,7 +2035,7 @@ static void gps_logging_task(void *pvParameters)
                 setenv("TZ", tz, 1);
                 tzset();
                 timezone_set_from_gps = true;
-                
+
                 // Display updated local time
                 time_t now = time(NULL);
                 struct tm timeinfo;
@@ -1928,6 +2044,25 @@ static void gps_logging_task(void *pvParameters)
                 ESP_LOGI(TAG, "Local time: %04d-%02d-%02d %02d:%02d:%02d",
                          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+                // GPS UTC time fallback: use GPS time if neither NTP nor RTC succeeded.
+                // Priority: NTP (best) → RTC → GPS UTC (this block).
+                if (!time_synced && !time_set_from_rtc && gps_data.gps_time_valid) {
+                    struct timeval tv_gps;
+                    tv_gps.tv_sec  = portable_timegm(&gps_data.gps_utc_time);
+                    tv_gps.tv_usec = 0;
+                    if (tv_gps.tv_sec > 0) {
+                        settimeofday(&tv_gps, NULL);
+                        ESP_LOGW(TAG, "System time set from GPS UTC (no NTP/RTC available): "
+                                      "%04d-%02d-%02d %02d:%02d:%02d UTC",
+                                 gps_data.gps_utc_time.tm_year + 1900,
+                                 gps_data.gps_utc_time.tm_mon  + 1,
+                                 gps_data.gps_utc_time.tm_mday,
+                                 gps_data.gps_utc_time.tm_hour,
+                                 gps_data.gps_utc_time.tm_min,
+                                 gps_data.gps_utc_time.tm_sec);
+                    }
+                }
             }
             
             if (log_to_csv(&log_gps, &avg_imu) == ESP_OK) {
@@ -2279,23 +2414,26 @@ void app_main(void)
         }
     }
     
+    // Set timezone before the RTC read so mktime() converts local→UTC correctly
+    // regardless of whether the RTC is present. The timezone will be refined later
+    // by get_timezone_from_gps() on the first valid GPS fix.
+    setenv("TZ", TIMEZONE, 1);
+    tzset();
+
     // Initialize RTC and set system time from it
     struct tm timeinfo;
     if (rtc_get_time(&timeinfo) == ESP_OK) {
         ESP_LOGI(TAG, "RTC time: %04d-%02d-%02d %02d:%02d:%02d",
                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        
-        // Set timezone
-        setenv("TZ", TIMEZONE, 1);
-        tzset();
-        
-        // Set system time from RTC
+
+        // Set system time from RTC (TZ already configured above)
         struct timeval tv;
         tv.tv_sec = mktime(&timeinfo);
         tv.tv_usec = 0;
         settimeofday(&tv, NULL);
-        
+        time_set_from_rtc = true;
+
         // Display local time
         time_t now = time(NULL);
         localtime_r(&now, &timeinfo);
@@ -2303,7 +2441,7 @@ void app_main(void)
                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
-        ESP_LOGE(TAG, "RTC initialization failed - check I2C connections");
+        ESP_LOGE(TAG, "RTC not available - time will be set from GPS UTC on first fix");
     }
     
     // Initialize SD Card
