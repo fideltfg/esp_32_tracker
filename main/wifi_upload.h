@@ -57,3 +57,12 @@ bool wifi_upload_all_csv(wifi_upload_report_t *report);
  * @return Result indicating failure, no data, or successful upload.
  */
 wifi_upload_result_t wifi_upload_merged_csv(void);
+
+/**
+ * @brief Re-upload all .bak archive files from the SD card to the server.
+ *        Useful for recovering data after a server-side failure.
+ *        Does NOT delete the .bak files after a successful upload.
+ * @param out_uploaded Optional — receives the count of files successfully uploaded.
+ * @return true if at least one file was uploaded and none failed.
+ */
+bool wifi_reupload_bak_files(int *out_uploaded);

@@ -47,13 +47,9 @@
 #include "wifi_upload.h"
 #include "espnow_sync.h"
 
-// WiFi Event Group
-static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-
+// WiFi
 static const char *TAG = "GPS_LOGGER";
-static int s_retry_num = 0;
+static int s_retry_num __attribute__((unused)) = 0;
 static bool time_synced = false;
 static bool time_set_from_rtc = false;  // RTC successfully set system time on boot
 static bool timezone_set_from_gps = false;
@@ -1354,82 +1350,22 @@ static esp_err_t log_to_csv(const gps_data_t *gps_data, const imu_data_t *imu_da
 
 /* ==================== WiFi Functions ==================== */
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < 5) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retry connecting to WiFi");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG, "Connection to WiFi failed");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
 static void wifi_init_sta(void)
 {
-    s_wifi_event_group = xEventGroupCreate();
-    
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-    
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                         ESP_EVENT_ANY_ID,
-                                                         &wifi_event_handler,
-                                                         NULL,
-                                                         &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                         IP_EVENT_STA_GOT_IP,
-                                                         &wifi_event_handler,
-                                                         NULL,
-                                                         &instance_got_ip));
-    
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    
+
     // Enable WiFi power save mode for better battery life
     // WIFI_PS_MIN_MODEM allows ESP-NOW to work while saving power
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-    ESP_LOGI(TAG, "WiFi power save mode enabled (ESP-NOW compatible)");
-    
-    ESP_LOGI(TAG, "WiFi initialization complete");
-    
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE,
-                                            pdFALSE,
-                                            portMAX_DELAY);
-    
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to WiFi SSID:%s", WIFI_SSID);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
-    }
+    ESP_LOGI(TAG, "WiFi hardware initialised (STA mode)");
 }
 
 /* ==================== Portable timegm ==================== */
@@ -1504,7 +1440,13 @@ static esp_err_t http_get_handler(httpd_req_t *req)
         "td{padding:4px 0}a{color:#0066cc}"
         ".danger{background:#c0392b;color:#fff;border:none;padding:8px 16px;"
         "font-family:monospace;font-size:14px;cursor:pointer;border-radius:3px}"
-        ".danger:hover{background:#a93226}</style></head><body>");
+        ".danger:hover{background:#a93226}"
+        ".action{background:#2980b9;color:#fff;border:none;padding:8px 16px;"
+        "font-family:monospace;font-size:14px;cursor:pointer;border-radius:3px;margin-right:8px}"
+        ".action:hover{background:#1a6fa0}"
+        ".warn{background:#e67e22;color:#fff;border:none;padding:8px 16px;"
+        "font-family:monospace;font-size:14px;cursor:pointer;border-radius:3px;margin-right:8px}"
+        ".warn:hover{background:#ca6f1e}</style></head><body>");
     httpd_resp_sendstr_chunk(req, "<h1>GPS Logger</h1>");
 
     // Device identity line
@@ -1547,8 +1489,14 @@ static esp_err_t http_get_handler(httpd_req_t *req)
     
     httpd_resp_sendstr_chunk(req,
         "<h2>Actions</h2>"
-        "<form method='POST' action='/clear' "
-        "onsubmit=\"return confirm('Delete all log files? This cannot be undone.');\">" 
+        "<form method='POST' action='/reupload_bak' style='display:inline'>"
+        "<button type='submit' class='action'>Re-upload backups</button>"
+        "</form>"
+        "<form method='POST' action='/clear_bak' style='display:inline' "
+        "onsubmit=\"return confirm('Delete all backup (.bak) files?');\">"
+        "<button type='submit' class='warn'>Clear backups</button>"
+        "</form>"
+        "<br><br>"
         "<button type='submit' class='danger'>Clear all data</button>"
         "</form>");
 
@@ -1631,6 +1579,67 @@ static esp_err_t http_clear_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t http_reupload_bak_handler(httpd_req_t *req)
+{
+    if (!wifi_is_connected()) {
+        if (!wifi_connect()) {
+            httpd_resp_set_type(req, "text/html");
+            httpd_resp_sendstr(req,
+                "<html><body><p>WiFi connection failed — cannot re-upload.</p>"
+                "<a href='/'>Back</a></body></html>");
+            return ESP_OK;
+        }
+    }
+
+    int uploaded = 0;
+    bool ok = wifi_reupload_bak_files(&uploaded);
+
+    char msg[512];
+    httpd_resp_set_type(req, "text/html");
+    if (ok) {
+        snprintf(msg, sizeof(msg),
+                 "<html><body><p>Re-uploaded %d backup file(s) successfully.</p>"
+                 "<a href='/'>Back</a></body></html>", uploaded);
+    } else if (uploaded > 0) {
+        snprintf(msg, sizeof(msg),
+                 "<html><body><p>Partial: %d file(s) uploaded but some failed. "
+                 "Failed files are preserved for retry.</p>"
+                 "<a href='/'>Back</a></body></html>", uploaded);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "<html><body><p>Re-upload failed or no backup files found.</p>"
+                 "<a href='/'>Back</a></body></html>");
+    }
+    httpd_resp_sendstr(req, msg);
+    return ESP_OK;
+}
+
+static esp_err_t http_clear_bak_handler(httpd_req_t *req)
+{
+    int deleted = 0;
+    DIR *d = opendir(SD_MOUNT_POINT);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t len = strlen(ent->d_name);
+            if (len > 4 && strcmp(ent->d_name + len - 4, ".bak") == 0) {
+                char full[272];
+                snprintf(full, sizeof(full), SD_MOUNT_POINT "/%s", ent->d_name);
+                if (remove(full) == 0) deleted++;
+            }
+        }
+        closedir(d);
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "<html><body><p>Deleted %d backup file(s).</p>"
+             "<a href='/'>Back</a></body></html>", deleted);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, msg);
+    return ESP_OK;
+}
+
 static esp_err_t http_status_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -1681,6 +1690,22 @@ static httpd_handle_t start_webserver(void)
             .user_ctx  = NULL
         };
         httpd_register_uri_handler(server, &uri_clear);
+
+        httpd_uri_t uri_reupload_bak = {
+            .uri       = "/reupload_bak",
+            .method    = HTTP_POST,
+            .handler   = http_reupload_bak_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &uri_reupload_bak);
+
+        httpd_uri_t uri_clear_bak = {
+            .uri       = "/clear_bak",
+            .method    = HTTP_POST,
+            .handler   = http_clear_bak_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &uri_clear_bak);
 
         ESP_LOGI(TAG, "HTTP server started");
     }
@@ -2505,26 +2530,24 @@ void app_main(void)
     gps_uart_init();
     gps_configure_5hz();
     
-    // Initialize WiFi
+    // Initialize WiFi hardware (STA mode, no connection attempt yet)
     wifi_init_sta();
 
-    // Register the WiFi-upload module's event handlers against the already-running
-    // WiFi driver so wifi_is_connected() works correctly from the sync task.
+    // Register the WiFi-upload module's event handlers (single set of handlers
+    // for the entire lifetime of the app — avoids dual-handler conflicts).
     wifi_stack_init();
 
-    // Initialize ESP-NOW peer sync (requires WiFi hardware to be up)
-    // espnow_init() is now called per-round inside sync_state_machine_task.
-
-    // Sync time via NTP
-    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-    if (bits & WIFI_CONNECTED_BIT) {
+    // Attempt initial WiFi connection using the AP list
+    if (wifi_connect()) {
+        ESP_LOGI(TAG, "WiFi connected at boot");
         initialize_sntp();
+    } else {
+        ESP_LOGW(TAG, "WiFi not available at boot — sync task will retry later");
     }
-    
-    // Start HTTP Server
-    if (bits & WIFI_CONNECTED_BIT) {
-        server = start_webserver();
-    }
+
+    // Start HTTP Server — always start so it's reachable whenever WiFi connects,
+    // even if the initial connection attempt failed or is still in progress.
+    server = start_webserver();
     
     // Start GPS logging task on Core 1 (GPS UART, IMU I2C, LCD I2C, RTC I2C)
     xTaskCreatePinnedToCore(gps_logging_task, "gps_logging", 4096, NULL, 5, NULL, 1);

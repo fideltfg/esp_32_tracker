@@ -4,6 +4,8 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_log.h"
@@ -93,26 +95,33 @@ void wifi_stack_init(void)
 
 bool wifi_connect(void)
 {
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    s_retry_count = 0;
+    for (int i = 0; i < (int)WIFI_AP_COUNT; i++) {
+        const wifi_ap_entry_t *ap = &WIFI_AP_LIST[i];
+        ESP_LOGI(TAG, "Trying AP %d/%d: %s", i + 1, (int)WIFI_AP_COUNT, ap->ssid);
 
-    wifi_config_t wifi_cfg = { 0 };
-    // Safe copies — SSID and password are compile-time constants
-    strncpy((char *)wifi_cfg.sta.ssid,     WIFI_SSID,     sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, WIFI_PASSWORD, sizeof(wifi_cfg.sta.password) - 1);
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        s_retry_count = 0;
 
-    // WiFi is already started in STA mode by the state machine.
-    // Just apply the config and kick off the connection.
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    esp_wifi_connect();
+        wifi_config_t wifi_cfg = { 0 };
+        strncpy((char *)wifi_cfg.sta.ssid,     ap->ssid,     sizeof(wifi_cfg.sta.ssid) - 1);
+        strncpy((char *)wifi_cfg.sta.password, ap->password, sizeof(wifi_cfg.sta.password) - 1);
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    // Block until connected or exhausted retries
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE,
-                                            portMAX_DELAY);
-    return (bits & WIFI_CONNECTED_BIT) != 0;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+        esp_wifi_connect();
+
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                                pdFALSE, pdFALSE,
+                                                portMAX_DELAY);
+        if (bits & WIFI_CONNECTED_BIT) {
+            return true;
+        }
+        ESP_LOGW(TAG, "AP \"%s\" failed, trying next...", ap->ssid);
+    }
+
+    ESP_LOGE(TAG, "All %d AP(s) failed.", (int)WIFI_AP_COUNT);
+    return false;
 }
 
 void wifi_disconnect(void)
@@ -403,14 +412,14 @@ wifi_upload_result_t wifi_upload_csv(void)
 {
     return do_csv_upload("own-data",
                          sd_stage_data_for_upload, sd_ensure_data_file,
-                         CSV_UPLOAD_STAGE, CSV_DATA_BAK_FMT);
+                         CSV_UPLOAD_STAGE, CSV_DATA_BACKUP);
 }
 
 wifi_upload_result_t wifi_upload_merged_csv(void)
 {
     return do_csv_upload("peer-data",
                          sd_stage_merged_for_upload, sd_ensure_merged_file,
-                         CSV_MERGE_STAGE, CSV_MERGED_BAK_FMT);
+                         CSV_MERGE_STAGE, CSV_MERGED_BACKUP);
 }
 
 bool wifi_upload_all_csv(wifi_upload_report_t *report)
@@ -433,4 +442,40 @@ bool wifi_upload_all_csv(wifi_upload_report_t *report)
     if (report) *report = local_report;
 
     return local_report.merged_data != WIFI_UPLOAD_FAILED;
+}
+
+bool wifi_reupload_bak_files(int *out_uploaded)
+{
+    int  uploaded   = 0;
+    bool any_failed = false;
+
+    DIR *d = opendir(SD_MOUNT_POINT);
+    if (!d) {
+        if (out_uploaded) *out_uploaded = 0;
+        return false;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len <= 4 || strcmp(ent->d_name + len - 4, ".bak") != 0) continue;
+
+        char full[272];
+        snprintf(full, sizeof(full), SD_MOUNT_POINT "/%s", ent->d_name);
+
+        struct stat st;
+        if (stat(full, &st) != 0 || st.st_size == 0) continue;
+
+        ESP_LOGI(TAG, "Re-uploading bak: %s", full);
+        if (upload_staged_file(ent->d_name, full)) {
+            uploaded++;
+        } else {
+            any_failed = true;
+            ESP_LOGW(TAG, "Re-upload failed for %s", full);
+        }
+    }
+    closedir(d);
+
+    if (out_uploaded) *out_uploaded = uploaded;
+    return uploaded > 0 && !any_failed;
 }
