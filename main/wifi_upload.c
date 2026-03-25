@@ -403,14 +403,14 @@ wifi_upload_result_t wifi_upload_csv(void)
 {
     return do_csv_upload("own-data",
                          sd_stage_data_for_upload, sd_ensure_data_file,
-                         CSV_UPLOAD_STAGE, CSV_DATA_BAK);
+                         CSV_UPLOAD_STAGE, CSV_DATA_BAK_FMT);
 }
 
 wifi_upload_result_t wifi_upload_merged_csv(void)
 {
     return do_csv_upload("peer-data",
                          sd_stage_merged_for_upload, sd_ensure_merged_file,
-                         CSV_MERGE_STAGE, CSV_MERGED_BAK);
+                         CSV_MERGE_STAGE, CSV_MERGED_BAK_FMT);
 }
 
 bool wifi_upload_all_csv(wifi_upload_report_t *report)
