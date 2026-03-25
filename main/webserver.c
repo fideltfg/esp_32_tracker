@@ -131,7 +131,10 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<button class='btn warn'>Clear backups</button></form>"
         "<form method='POST' action='/clear' style='display:inline' "
         "onsubmit=\"return confirm('Clear ALL data files?');\">"
-        "<button class='btn danger'>Clear all data</button></form>");
+        "<button class='btn danger'>Clear all data</button></form>"
+        "<form method='POST' action='/reboot' style='display:inline;margin-left:16px' "
+        "onsubmit=\"return confirm('Reboot the device?');\">"
+        "<button class='btn warn'>Reboot</button></form>");
 
     httpd_resp_sendstr_chunk(req, "</body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
@@ -722,6 +725,17 @@ static esp_err_t handle_ota_upload(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── POST /reboot — Reboot device ────────────────────────────────────────────
+
+static esp_err_t handle_reboot(httpd_req_t *req)
+{
+    httpd_resp_sendstr(req, "<html><body><p>Rebooting...</p>"
+                       "<a href='/'>Back</a></body></html>");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
 // ── GET /status — JSON status ────────────────────────────────────────────────
 
 static esp_err_t handle_status(httpd_req_t *req)
@@ -769,6 +783,7 @@ httpd_handle_t webserver_start(void)
         { "/api/config",    HTTP_GET,  handle_api_config_get, NULL },
         { "/api/config",    HTTP_POST, handle_api_config_post, NULL },
         { "/api/reset_config", HTTP_POST, handle_reset_config, NULL },
+        { "/reboot",          HTTP_POST, handle_reboot,        NULL },
         // Pages
         { "/map",           HTTP_GET,  handle_map,           NULL },
         { "/config",        HTTP_GET,  handle_config_page,   NULL },
