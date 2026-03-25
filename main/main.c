@@ -413,6 +413,17 @@ static void sync_state_machine_task(void *arg)
         }
 
         ESP_LOGI(TAG, "Sync window done (iter=%d)", search_time);
+
+        // Enter deep sleep when STAGE3 sync is complete to conserve battery.
+        // power_deep_sleep_ready() enforces a minimum uptime grace period after
+        // deep-sleep wake so the system has time to detect motion / get GPS fix.
+        if (power_deep_sleep_ready()) {
+            ESP_LOGW(TAG, "STAGE3 sync complete — entering deep sleep");
+            wifi_mgr_disconnect();
+            power_enter_deep_sleep();
+            // Does not return; device reboots on wake
+        }
+
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }

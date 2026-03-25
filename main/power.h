@@ -48,6 +48,12 @@ uint32_t power_get_log_interval_ms(void);
 bool power_is_static(const gps_data_t *gps, const imu_data_t *imu);
 
 /**
+ * @brief Returns true when STAGE3 and minimum uptime grace period has elapsed.
+ *        Use this before entering deep sleep to avoid immediate re-sleep.
+ */
+bool power_deep_sleep_ready(void);
+
+/**
  * @brief Enter deep sleep with IMU wake-on-motion or timer fallback.
  *        Only call from STAGE3 when no pending work remains.
  */

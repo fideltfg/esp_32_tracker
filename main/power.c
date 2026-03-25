@@ -13,6 +13,10 @@
 
 static const char *TAG = "POWER";
 
+// Persist across deep sleep so we resume at STAGE3 without re-waiting
+static RTC_DATA_ATTR power_state_t  s_rtc_state         = POWER_STATE_MOVING;
+static RTC_DATA_ATTR uint32_t       s_rtc_stationary_ms  = 0;
+
 static volatile power_state_t s_state = POWER_STATE_MOVING;
 static uint32_t s_stationary_ms   = 0;
 static uint32_t s_log_interval_ms = 0;
@@ -25,6 +29,10 @@ static bool    s_was_stationary  = false;
 
 // Position lock timing
 static TickType_t s_lock_release_tick = 0;
+
+// Grace period: minimum uptime before allowing deep sleep re-entry (60 s)
+#define DEEP_SLEEP_GRACE_MS 60000
+static TickType_t s_boot_tick = 0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -40,13 +48,34 @@ static void log_transition(power_state_t from, power_state_t to)
 
 void power_init(void)
 {
-    s_state = POWER_STATE_MOVING;
-    s_log_interval_ms = config_get()->log_moving_ms;
+    const tracker_config_t *cfg = config_get();
+
+    // Restore state if waking from deep sleep
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED &&
+        s_rtc_state >= POWER_STATE_STAGE3) {
+        s_state           = s_rtc_state;
+        s_stationary_ms   = s_rtc_stationary_ms;
+        s_log_interval_ms = cfg->log_stage3_ms;
+        ESP_LOGI(TAG, "Restored STAGE3 from deep sleep (stationary %lu ms)",
+                 (unsigned long)s_stationary_ms);
+    } else {
+        s_state           = POWER_STATE_MOVING;
+        s_log_interval_ms = cfg->log_moving_ms;
+    }
+
     s_lock_release_tick = xTaskGetTickCount();
+    s_boot_tick = s_lock_release_tick;
 }
 
 power_state_t power_get_state(void)       { return s_state; }
 uint32_t power_get_log_interval_ms(void) { return s_log_interval_ms; }
+
+bool power_deep_sleep_ready(void)
+{
+    if (s_state < POWER_STATE_STAGE3) return false;
+    uint32_t uptime_ms = (uint32_t)((xTaskGetTickCount() - s_boot_tick) * portTICK_PERIOD_MS);
+    return uptime_ms >= DEEP_SLEEP_GRACE_MS;
+}
 
 bool power_is_static(const gps_data_t *gps, const imu_data_t *imu)
 {
@@ -105,6 +134,8 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
         if (s_stationary_ms >= cfg->stage3_thresh_ms && s_state != POWER_STATE_STAGE3) {
             s_state = POWER_STATE_STAGE3;
             s_log_interval_ms = cfg->log_stage3_ms;
+            s_rtc_state        = s_state;
+            s_rtc_stationary_ms = s_stationary_ms;
             log_transition(old, s_state);
         } else if (s_stationary_ms >= cfg->stage2_thresh_ms && s_state < POWER_STATE_STAGE2) {
             s_state = POWER_STATE_STAGE2;
@@ -127,6 +158,8 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
                 log_transition(old, s_state);
             }
             s_stationary_ms = 0;
+            s_rtc_state         = POWER_STATE_MOVING;
+            s_rtc_stationary_ms = 0;
             if (gps_is_position_locked()) {
                 gps_unlock_position();
                 s_lock_release_tick = xTaskGetTickCount();
@@ -141,7 +174,13 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
 void power_fast_motion_check(const gps_data_t *gps, const imu_data_t *imu,
                              uint32_t *interval_ms)
 {
-    if (s_state == POWER_STATE_MOVING || !gps->valid) {
+    if (s_state == POWER_STATE_MOVING) {
+        s_fast_motion = 0;
+        return;
+    }
+
+    // Need at least one working sensor
+    if (!gps->valid && !imu_is_available()) {
         s_fast_motion = 0;
         return;
     }
@@ -152,9 +191,12 @@ void power_fast_motion_check(const gps_data_t *gps, const imu_data_t *imu,
     float gm = sqrtf(imu->gyro_x*imu->gyro_x + imu->gyro_y*imu->gyro_y +
                      imu->gyro_z*imu->gyro_z);
 
-    bool moving = (!gps_is_position_locked() && (gps->speed >= cfg->gps_static_kmh)) ||
-                  (fabsf(am - 1.0f) >= cfg->imu_accel_dev) ||
-                  (gm >= cfg->imu_gyro_dps);
+    bool imu_moving = imu_is_available() &&
+                      ((fabsf(am - 1.0f) >= cfg->imu_accel_dev) ||
+                       (gm >= cfg->imu_gyro_dps));
+    bool gps_moving = gps->valid && !gps_is_position_locked() &&
+                      (gps->speed >= cfg->gps_static_kmh);
+    bool moving = imu_moving || gps_moving;
 
     if (moving) {
         s_fast_motion++;
@@ -165,6 +207,8 @@ void power_fast_motion_check(const gps_data_t *gps, const imu_data_t *imu,
             s_stationary_ms    = 0;
             s_motion_count     = 0;
             s_was_stationary   = false;
+            s_rtc_state         = POWER_STATE_MOVING;
+            s_rtc_stationary_ms = 0;
             if (gps_is_position_locked()) {
                 gps_unlock_position();
                 s_lock_release_tick = xTaskGetTickCount();
