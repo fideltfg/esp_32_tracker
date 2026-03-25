@@ -88,12 +88,19 @@
 // Any motion immediately restores full logging and uploads.
 // ESP-NOW peer sync remains active in all power states.
 //
-#define LOG_INTERVAL_MOVING_MS      1000   // Fast logging when moving (1 second)
-#define LOG_INTERVAL_STAGE1_MS     60000   // Stage 1: Static 3+ mins (1 minute)
-#define LOG_INTERVAL_STAGE2_MS    300000   // Stage 2: Static 5+ mins, low power (5 minutes)
+#define LOG_INTERVAL_MOVING_MS       1000   // Fast logging when moving (1 second)
+#define LOG_INTERVAL_STAGE1_MS      60000   // Stage 1: Static 3+ mins (1 minute)
+#define LOG_INTERVAL_STAGE2_MS     300000   // Stage 2: Static 5+ mins, low power (5 minutes)
+#define LOG_INTERVAL_STAGE3_MS    1800000   // Stage 3: Parked 30+ mins (30 min heartbeat)
 
-#define STATIC_STAGE1_THRESHOLD_MS 180000  // 3 minutes static -> Stage 1
-#define STATIC_STAGE2_THRESHOLD_MS 300000  // 5 minutes static -> Stage 2 (low power)
+#define STATIC_STAGE1_THRESHOLD_MS   180000  // 3 minutes static -> Stage 1
+#define STATIC_STAGE2_THRESHOLD_MS   300000  // 5 minutes static -> Stage 2 (low power)
+#define STATIC_STAGE3_THRESHOLD_MS  1800000  // 30 minutes static -> Stage 3 (parked)
+
+// Time-based GPS re-lock thresholds (independent of log interval)
+#define GPS_RELOCK_TIME_STAGE1_MS   30000   //  30 s  (test; ~120 000 ms production)
+#define GPS_RELOCK_TIME_STAGE2_MS  120000   //   2 min (test; ~300 000 ms production)
+#define GPS_RELOCK_TIME_STAGE3_MS  300000   //   5 min (test; ~600 000 ms production)
 
 // ─── Motion detection thresholds ─────────────────────────────────────────────
 #define GPS_STATIC_SPEED_KMH  2.0f    // km/h  — below this = stationary
