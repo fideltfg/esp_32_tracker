@@ -1,5 +1,5 @@
 #include "sd_storage.h"
-#include "sync_config.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +38,7 @@ bool sd_init(void)
 
     // In ESP-IDF v5.x, esp_vfs_fat_sdmmc_mount re-runs SDMMC card init (CMD0
     // sequence) BEFORE checking whether the VFS path is already registered.
-    // If sd_card_init() in main.c already mounted /sdcard, that re-init
+    // If the SD card was already mounted by main, that re-init
     // disturbs the card and returns an error — ESP_ERR_INVALID_STATE is never
     // reached. Guard against this by testing the mount point directly.
     struct stat mnt_st;

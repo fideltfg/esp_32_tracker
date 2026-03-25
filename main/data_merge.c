@@ -1,5 +1,5 @@
 #include "data_merge.h"
-#include "sync_config.h"
+#include "config.h"
 #include "sd_storage.h"
 
 #include <stdio.h>

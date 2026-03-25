@@ -1,5 +1,5 @@
 #include "espnow_sync.h"
-#include "sync_config.h"
+#include "config.h"
 #include "sd_storage.h"
 #include "data_merge.h"
 
