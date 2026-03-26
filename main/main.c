@@ -373,6 +373,7 @@ static void sync_state_machine_task(void *arg)
         const tracker_config_t *cfg = config_get();
         int     search_time       = 0;
         int64_t next_wifi_attempt = 0;
+        static bool s_sntp_started = false;
 
         while (power_is_static(&g_current_gps, &g_current_imu) &&
                search_time < cfg->sync_search_max) {
@@ -388,6 +389,7 @@ static void sync_state_machine_task(void *arg)
                     wifi_mgr_connect();
                 }
                 if (wifi_mgr_is_connected()) {
+                    if (!s_sntp_started) { sntp_start(); s_sntp_started = true; }
                     ESP_LOGI(TAG, "[%d] Uploading...", search_time);
                     upload_report_t report = {0};
                     if (upload_all_csv(&report)) {
@@ -517,19 +519,14 @@ void app_main(void)
         ESP_LOGI(TAG, "Woke from deep sleep");
     }
 
-    // WiFi
+    // WiFi stack init (fast, non-blocking — connect is handled by the sync task)
     wifi_mgr_init();
-    if (wifi_mgr_connect()) {
-        ESP_LOGI(TAG, "WiFi connected at boot");
-        sntp_start();
-    } else {
-        ESP_LOGW(TAG, "WiFi not available at boot");
-    }
 
     // Web server
     server = webserver_start();
 
-    // Tasks
+    // Tasks — start BEFORE attempting WiFi so GPS logging begins immediately,
+    // regardless of whether a network is reachable.
     xTaskCreatePinnedToCore(gps_logging_task, "gps_log", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(sync_state_machine_task, "sync_sm", 8192, NULL, 4, NULL, 0);
 
