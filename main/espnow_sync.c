@@ -20,7 +20,7 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 
-static const char *TAG = "espnow_sync";
+static const char *TAG = "ESPNOW";
 
 // ─── Frame types ──────────────────────────────────────────────────────────────
 #define MSG_ANNOUNCE  0x01

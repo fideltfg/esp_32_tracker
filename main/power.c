@@ -22,7 +22,7 @@ static uint32_t s_stationary_ms   = 0;
 static uint32_t s_log_interval_ms = 0;
 
 // Debounce
-#define MOTION_CONFIRM_TICKS 5
+#define MOTION_CONFIRM_TICKS 2
 static uint8_t s_motion_count    = 0;
 static uint8_t s_fast_motion     = 0;
 static bool    s_was_stationary  = false;
@@ -116,7 +116,7 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
     bool imu_only = gps_is_position_locked() || (s_state >= POWER_STATE_STAGE2);
     bool stationary = imu_stat && (imu_only || gps_stat);
 
-    if (stationary) {
+    if (imu_is_static(imu)){//} && gps_stat) {
         s_stationary_ms += s_log_interval_ms;
         s_motion_count = 0;
 

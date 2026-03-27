@@ -230,11 +230,19 @@ bool upload_all_csv(upload_report_t *report)
     r.own_data = upload_own_csv();
     if (r.own_data == UPLOAD_FAILED) {
         if (report) *report = r;
+        ESP_LOGE(TAG, "Own data upload failed");
         return false;
     }
+    ESP_LOGI(TAG, "Own data upload result: %d", r.own_data);
     vTaskDelay(pdMS_TO_TICKS(200));
 
     r.merged_data = upload_merged_csv();
+    if (r.merged_data == UPLOAD_FAILED) {
+        if (report) *report = r;
+        ESP_LOGE(TAG, "Merged data upload failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "Merged data upload result: %d", r.merged_data);
     if (report) *report = r;
     return r.merged_data != UPLOAD_FAILED;
 }

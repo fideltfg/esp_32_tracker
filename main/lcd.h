@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "driver/i2c_master.h"
+#include "types.h"
 
 /**
  * @brief Initialise LCD1602A on the given I2C bus.
@@ -66,3 +67,18 @@ bool lcd_request_wake(void);
  *        Returns true if the display was actually woken.
  */
 bool lcd_process_wake(void);
+
+/**
+ * @brief Toggle between display mode 0 (GPS/IMU) and mode 1 (Time/IP).
+ *        Safe to call from ISR context.
+ */
+void lcd_toggle_mode(void);
+
+/**
+ * @brief Update the LCD contents for the current display mode.
+ *        Handles mode-change clears and last_mode tracking internally.
+ * @param gps     Latest GPS data.
+ * @param imu     Latest (averaged) IMU data.
+ * @param has_fix True when the GPS has a valid fix.
+ */
+void lcd_update(const gps_data_t *gps, const imu_data_t *imu, bool has_fix);

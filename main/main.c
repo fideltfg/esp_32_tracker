@@ -53,8 +53,6 @@ static i2c_master_bus_handle_t i2c_bus1 = NULL;
 static httpd_handle_t          server   = NULL;
 static sdmmc_card_t           *card     = NULL;
 
-// Display mode: 0 = GPS/IMU, 1 = Time/IP
-static volatile uint8_t  display_mode    = 0;
 static volatile uint32_t last_button_time = 0;
 
 // Time flags
@@ -128,7 +126,7 @@ static void IRAM_ATTR button_isr_handler(void *arg)
         if (lcd_request_wake()) {
             // LCD was off — wake it; don't toggle mode
         } else {
-            display_mode = (display_mode + 1) % 2;
+            lcd_toggle_mode();
         }
     }
 }
@@ -189,18 +187,34 @@ static time_t portable_timegm(struct tm *utc_tm)
 
 static esp_err_t log_to_csv(const gps_data_t *gps, const imu_data_t *imu)
 {
-    if (!gps->valid || (gps->latitude == 0.0f && gps->longitude == 0.0f))
+    if (!gps->valid || (gps->latitude == 0.0f && gps->longitude == 0.0f)){
+        ESP_LOGE(TAG, "Invalid GPS data — skipping log");
         return ESP_OK;
+    }
 
-    // Skip unchanged positions unless heartbeat is due
+  
     static float   last_lat = 0, last_lon = 0, last_alt = 0;
     static int64_t last_ts  = 0;
     int64_t now_ts = (int64_t)time(NULL);
     bool same = (gps->latitude == last_lat && gps->longitude == last_lon &&
                  gps->altitude == last_alt);
-    if (same && (now_ts - last_ts) < 60) return ESP_OK;
 
+    // get th current IMU static state for this log entry (used in gps_filter_position)
+    bool imu_static = imu_is_static(imu);
+
+
+
+    // Skip unchanged positions unless heartbeat is due
+    // if (same && imu_static && (now_ts - last_ts) < 90) {
+    //     ESP_LOGW(TAG, "Position: (%.6f, %.6f, %.1f) unchanged — skipping log",
+    //              gps->latitude, gps->longitude, gps->altitude);
+    //     return ESP_OK;
+    // }
+
+    // if position is the same speed must be zero.
     float speed = same ? 0.0f : gps->speed;
+
+    // create CSV row and append to file
     char row[128];
     snprintf(row, sizeof(row),
              "%" PRId64 ",%.6f,%.6f,%.1f,%.1f,%.4f,%.4f,%.4f,%s\n",
@@ -208,6 +222,9 @@ static esp_err_t log_to_csv(const gps_data_t *gps, const imu_data_t *imu)
              gps->latitude, gps->longitude, gps->altitude, speed,
              imu->accel_x, imu->accel_y, imu->accel_z,
              g_own_mac_str);
+
+    ESP_LOGW(TAG, "Logged: %s", row);
+
 
     if (!sd_append_record(row)) return ESP_FAIL;
     last_lat = gps->latitude;
@@ -217,44 +234,12 @@ static esp_err_t log_to_csv(const gps_data_t *gps, const imu_data_t *imu)
     return ESP_OK;
 }
 
-// ── LCD display helper ───────────────────────────────────────────────────────
-
-static void lcd_update(uint8_t *last_mode, const gps_data_t *gps,
-                        const imu_data_t *imu, bool has_fix)
-{
-    if (!lcd_is_initialized() || !lcd_is_on()) return;
-    if (display_mode != *last_mode) {
-        lcd_clear();
-        *last_mode = display_mode;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    if (display_mode == 0) {
-        if (has_fix) {
-            lcd_printf(0, 0, "%.1fkm %.1fm", gps->speed, gps->altitude);
-            lcd_printf(0, 1, "%.4f,%.4f", gps->latitude, gps->longitude);
-        } else {
-            lcd_printf(0, 0, "No GPS Fix");
-            lcd_printf(0, 1, "A:%.2f,%.2f,%.2f",
-                       imu->accel_x, imu->accel_y, imu->accel_z);
-        }
-    } else {
-        time_t now = time(NULL);
-        struct tm ti;
-        localtime_r(&now, &ti);
-        char ip[16];
-        wifi_mgr_get_ip_str(ip, sizeof(ip));
-        lcd_printf(0, 0, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
-        lcd_printf(0, 1, "%s", ip);
-    }
-}
-
 // ── GPS logging task (Core 1) ────────────────────────────────────────────────
 
 static void gps_logging_task(void *arg)
 {
     gps_data_t gps = {0}, log_gps = {0};
     imu_data_t imu = {0};
-    uint8_t    last_disp_mode = 0xFF;
     uint32_t   lcd_resync_ctr = 0;
 
     // IMU averaging accumulators
@@ -266,8 +251,9 @@ static void gps_logging_task(void *arg)
     TickType_t last_log_tick   = 0;
     bool       imu_static_last = false;
 
-    ESP_LOGI(TAG, "GPS logging task started");
+    imu_calibrate(); // runs on Core 1, parallel to sync task startup
 
+    ESP_LOGI(TAG, "GPS logging task started");
     while (1) {
         // ── Sample GPS + IMU at ~5 Hz ────────────────────────────────────────
         bool new_fix = gps_read(&gps);
@@ -339,7 +325,7 @@ static void gps_logging_task(void *arg)
 
         // Write CSV + update LCD
         log_to_csv(&log_gps, &avg_imu);
-        lcd_update(&last_disp_mode, &log_gps, &avg_imu, gps.valid);
+        lcd_update(&log_gps, &avg_imu, gps.valid);
 
         // Periodic LCD resync (~5 s)
         if (lcd_is_initialized() && lcd_is_on()) {
@@ -357,8 +343,6 @@ static void gps_logging_task(void *arg)
 static void sync_state_machine_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(5000));
-    sd_ensure_data_file();
-    sd_ensure_merged_file();
     ESP_LOGI(TAG, "Sync state machine started");
 
     while (true) {
@@ -390,7 +374,6 @@ static void sync_state_machine_task(void *arg)
                 }
                 if (wifi_mgr_is_connected()) {
                     if (!s_sntp_started) { sntp_start(); s_sntp_started = true; }
-                    ESP_LOGI(TAG, "[%d] Uploading...", search_time);
                     upload_report_t report = {0};
                     if (upload_all_csv(&report)) {
                         if (report.own_data == UPLOAD_OK)
@@ -453,30 +436,8 @@ void app_main(void)
     ESP_LOGI(TAG, "I2C Bus 0 (IMU/RTC): SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
     ESP_LOGI(TAG, "I2C Bus 1 (LCD): SDA=%d SCL=%d", LCD_I2C_SDA_PIN, LCD_I2C_SCL_PIN);
 
-    // LCD
-#if LCD_ENABLED
-    if (lcd_init(i2c_bus1) == ESP_OK) {
-        lcd_clear();
-        lcd_printf(0, 0, "GPS Tracker");
-        lcd_printf(0, 1, "Initializing...");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-#endif
-
-    // Button
-    button_init();
-
-    // IMU
-    if (imu_init(i2c_bus0) == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        imu_calibrate();
-    } else {
-        ESP_LOGW(TAG, "IMU not found");
-    }
-
     // Set timezone before RTC read
-    setenv("TZ", cfg->timezone, 1);
-    tzset();
+    setenv("TZ", cfg->timezone, 1);  tzset();
 
     // RTC → system time
     if (rtc_module_init(i2c_bus0) == ESP_OK) {
@@ -487,6 +448,14 @@ void app_main(void)
             time_set_from_rtc = true;
             ESP_LOGI(TAG, "System time set from RTC");
         }
+    }
+
+    // GPS — start UART as early as possible for fastest first fix
+    gps_init();
+
+    // IMU — init only; calibration deferred to Core 1 (gps_logging_task)
+    if (imu_init(i2c_bus0) != ESP_OK) {
+        ESP_LOGW(TAG, "IMU not found");
     }
 
     // SD card
@@ -508,8 +477,23 @@ void app_main(void)
     sd_ensure_data_file();
     sd_ensure_merged_file();
 
-    // GPS
-    gps_init();
+    // WiFi stack init (fast, non-blocking — connect is handled by the sync task)
+    wifi_mgr_init();
+
+    // Web server
+    server = webserver_start();
+
+    // LCD — deferred past GPS/IMU/SD; splash delay removed (task updates immediately)
+#if LCD_ENABLED
+    if (lcd_init(i2c_bus1) == ESP_OK) {
+        lcd_clear();
+        lcd_printf(0, 0, "GPS Tracker");
+        lcd_printf(0, 1, "Initializing...");
+    }
+#endif
+
+    // Button
+    button_init();
 
     // Power manager
     power_init();
@@ -518,12 +502,6 @@ void app_main(void)
     if (power_check_wake_reason()) {
         ESP_LOGI(TAG, "Woke from deep sleep");
     }
-
-    // WiFi stack init (fast, non-blocking — connect is handled by the sync task)
-    wifi_mgr_init();
-
-    // Web server
-    server = webserver_start();
 
     // Tasks — start BEFORE attempting WiFi so GPS logging begins immediately,
     // regardless of whether a network is reachable.

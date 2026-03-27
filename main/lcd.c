@@ -2,9 +2,11 @@
 
 #include "lcd.h"
 #include "config.h"
+#include "wifi_manager.h"
 
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -44,6 +46,8 @@ static char    s_lines[2][17] = {{0}, {0}};
 
 static volatile bool     s_wake_requested = false;
 static volatile uint32_t s_last_activity   = 0;
+static volatile uint8_t  s_display_mode    = 0;
+static uint8_t           s_last_disp_mode  = 0xFF;
 
 // ── Low-level I2C ────────────────────────────────────────────────────────────
 
@@ -241,4 +245,37 @@ bool lcd_process_wake(void)
     lcd_set_power(true);
     s_last_activity = xTaskGetTickCount();
     return true;
+}
+
+void lcd_toggle_mode(void)
+{
+    s_display_mode = (s_display_mode + 1) % 2;
+}
+
+void lcd_update(const gps_data_t *gps, const imu_data_t *imu, bool has_fix)
+{
+    if (!s_initialized || !s_display_on) return;
+    if (s_display_mode != s_last_disp_mode) {
+        lcd_clear();
+        s_last_disp_mode = s_display_mode;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (s_display_mode == 0) {
+        if (has_fix) {
+            lcd_printf(0, 0, "%.1fkm %.1fm", gps->speed, gps->altitude);
+            lcd_printf(0, 1, "%.4f,%.4f", gps->latitude, gps->longitude);
+        } else {
+            lcd_printf(0, 0, "No GPS Fix");
+            lcd_printf(0, 1, "A:%.2f,%.2f,%.2f",
+                       imu->accel_x, imu->accel_y, imu->accel_z);
+        }
+    } else {
+        time_t now = time(NULL);
+        struct tm ti;
+        localtime_r(&now, &ti);
+        char ip[16];
+        wifi_mgr_get_ip_str(ip, sizeof(ip));
+        lcd_printf(0, 0, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+        lcd_printf(0, 1, "%s", ip);
+    }
 }
