@@ -1,4 +1,4 @@
-// power.c — Progressive power state machine + deep sleep.
+// power.c — Power state machine (staging disabled; always MOVING rate).
 
 #include "power.h"
 #include "config.h"
@@ -13,12 +13,12 @@
 
 static const char *TAG = "POWER";
 
-// Persist across deep sleep so we resume at STAGE3 without re-waiting
+// RTC attrs retained so layout is unchanged across flash cycles,
+// but staging is not restored — device always boots into MOVING.
 static RTC_DATA_ATTR power_state_t  s_rtc_state         = POWER_STATE_MOVING;
 static RTC_DATA_ATTR uint32_t       s_rtc_stationary_ms  = 0;
 
 static volatile power_state_t s_state = POWER_STATE_MOVING;
-static uint32_t s_stationary_ms   = 0;
 static uint32_t s_log_interval_ms = 0;
 
 // Debounce
@@ -49,22 +49,14 @@ static void log_transition(power_state_t from, power_state_t to)
 void power_init(void)
 {
     const tracker_config_t *cfg = config_get();
-
-    // Restore state if waking from deep sleep
-    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED &&
-        s_rtc_state >= POWER_STATE_STAGE3) {
-        s_state           = s_rtc_state;
-        s_stationary_ms   = s_rtc_stationary_ms;
-        s_log_interval_ms = cfg->log_stage3_ms;
-        ESP_LOGI(TAG, "Restored STAGE3 from deep sleep (stationary %lu ms)",
-                 (unsigned long)s_stationary_ms);
-    } else {
-        s_state           = POWER_STATE_MOVING;
-        s_log_interval_ms = cfg->log_moving_ms;
-    }
-
-    s_lock_release_tick = xTaskGetTickCount();
-    s_boot_tick = s_lock_release_tick;
+    s_state             = POWER_STATE_MOVING;
+    s_log_interval_ms   = cfg->log_moving_ms;
+    s_rtc_state         = POWER_STATE_MOVING;
+    s_rtc_stationary_ms = 0;
+    s_stationary_since  = xTaskGetTickCount();
+    s_was_stationary    = false;
+    ESP_LOGI(TAG, "Power staging disabled — always MOVING rate (%lu ms)",
+             (unsigned long)cfg->log_moving_ms);
 }
 
 power_state_t power_get_state(void)       { return s_state; }
@@ -72,9 +64,7 @@ uint32_t power_get_log_interval_ms(void) { return s_log_interval_ms; }
 
 bool power_deep_sleep_ready(void)
 {
-    if (s_state < POWER_STATE_STAGE3) return false;
-    uint32_t uptime_ms = (uint32_t)((xTaskGetTickCount() - s_boot_tick) * portTICK_PERIOD_MS);
-    return uptime_ms >= DEEP_SLEEP_GRACE_MS;
+    return false;   // staging disabled — deep sleep never triggered automatically
 }
 
 bool power_is_static(const gps_data_t *gps, const imu_data_t *imu)
@@ -92,9 +82,6 @@ bool power_is_static(const gps_data_t *gps, const imu_data_t *imu)
         imu_data_t d = *imu;
         imu_static = imu_is_static(&d);
     }
-
-    if (s_state >= POWER_STATE_STAGE2)
-        return !imu_ok || imu_static;
 
     if (gps_ok && imu_ok) return gps_static && imu_static;
     if (gps_ok)           return gps_static;
@@ -149,77 +136,28 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
 
         s_was_stationary = true;
     } else {
+        // Require several consecutive moving samples before releasing lock
+        // so brief vibration spikes do not break it.
         s_motion_count++;
-        if (s_motion_count >= MOTION_CONFIRM_TICKS) {
-            if (s_was_stationary || s_state != POWER_STATE_MOVING) {
-                power_state_t old = s_state;
-                s_state = POWER_STATE_MOVING;
-                s_log_interval_ms = cfg->log_moving_ms;
-                log_transition(old, s_state);
-            }
-            s_stationary_ms = 0;
-            s_rtc_state         = POWER_STATE_MOVING;
-            s_rtc_stationary_ms = 0;
+        if (s_motion_count >= LOCK_MOTION_CONFIRM) {
+            s_motion_count   = 0;
+            s_was_stationary = false;
             if (gps_is_position_locked()) {
                 gps_unlock_position();
-                s_lock_release_tick = xTaskGetTickCount();
             }
+            s_stationary_since = xTaskGetTickCount();
         }
-        s_was_stationary = false;
     }
 
+    // Staging disabled — log interval is always log_moving_ms.
     *interval_ms = s_log_interval_ms;
 }
 
 void power_fast_motion_check(const gps_data_t *gps, const imu_data_t *imu,
                              uint32_t *interval_ms)
 {
-    if (s_state == POWER_STATE_MOVING) {
-        s_fast_motion = 0;
-        return;
-    }
-
-    // Need at least one working sensor
-    if (!gps->valid && !imu_is_available()) {
-        s_fast_motion = 0;
-        return;
-    }
-
-    const tracker_config_t *cfg = config_get();
-    float am = sqrtf(imu->accel_x*imu->accel_x + imu->accel_y*imu->accel_y +
-                     imu->accel_z*imu->accel_z);
-    float gm = sqrtf(imu->gyro_x*imu->gyro_x + imu->gyro_y*imu->gyro_y +
-                     imu->gyro_z*imu->gyro_z);
-
-    bool imu_moving = imu_is_available() &&
-                      ((fabsf(am - 1.0f) >= cfg->imu_accel_dev) ||
-                       (gm >= cfg->imu_gyro_dps));
-    bool gps_moving = gps->valid && !gps_is_position_locked() &&
-                      (gps->speed >= cfg->gps_static_kmh);
-    bool moving = imu_moving || gps_moving;
-
-    if (moving) {
-        s_fast_motion++;
-        if (s_fast_motion >= MOTION_CONFIRM_TICKS) {
-            power_state_t old = s_state;
-            s_state = POWER_STATE_MOVING;
-            s_log_interval_ms  = cfg->log_moving_ms;
-            s_stationary_ms    = 0;
-            s_motion_count     = 0;
-            s_was_stationary   = false;
-            s_rtc_state         = POWER_STATE_MOVING;
-            s_rtc_stationary_ms = 0;
-            if (gps_is_position_locked()) {
-                gps_unlock_position();
-                s_lock_release_tick = xTaskGetTickCount();
-            }
-            log_transition(old, s_state);
-            s_fast_motion = 0;
-            *interval_ms = s_log_interval_ms;
-        }
-    } else {
-        s_fast_motion = 0;
-    }
+    (void)gps; (void)imu; (void)interval_ms;
+    // No-op — state is always MOVING; no stage to exit.
 }
 
 void power_enter_deep_sleep(void)

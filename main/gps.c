@@ -21,6 +21,7 @@ static uint8_t *s_uart_buf = NULL;
 // EMA filter state (double precision for lat/lon to avoid float error)
 static double  s_ema_lat = 0.0, s_ema_lon = 0.0;
 static float   s_ema_alt = 0.0f;
+static float   s_ema_speed = 0.0f;
 static bool    s_ema_init = false;
 
 // Position lock
@@ -289,49 +290,67 @@ void gps_filter_position(gps_data_t *data, bool is_static)
 {
     const tracker_config_t *cfg = config_get();
 
-    // Quality gate
-    if (data->hdop > cfg->gps_max_hdop || data->num_sv < cfg->gps_min_sv)
-        return;
-
-    if (!s_ema_init) {
-        s_ema_lat  = data->latitude;
-        s_ema_lon  = data->longitude;
-        s_ema_alt  = data->altitude;
-        s_ema_init = true;
-    } else if (is_static && !s_pos_locked) {
-        // Outlier rejection
-        double dlat   = data->latitude  - s_ema_lat;
-        double dlon   = data->longitude - s_ema_lon;
-        double coslat = cos(s_ema_lat * M_PI / 180.0);
-        double dist_m = sqrt((dlat*dlat + dlon*dlon*coslat*coslat) * 111120.0 * 111120.0);
-        if (dist_m < cfg->gps_outlier_m) {
-            float a = cfg->gps_ema_alpha;
-            s_ema_lat = a * data->latitude  + (1.0 - a) * s_ema_lat;
-            s_ema_lon = a * data->longitude + (1.0 - a) * s_ema_lon;
-            s_ema_alt = a * data->altitude  + (1.0f - a) * s_ema_alt;
+    // Quality gate: only feed high-quality fixes into the EMA state.
+    // Position lock enforcement and speed zeroing always run regardless.
+    bool quality_ok = (data->hdop <= cfg->gps_max_hdop &&
+                       data->num_sv >= cfg->gps_min_sv);
+    if (quality_ok) {
+        if (!s_ema_init) {
+            s_ema_lat   = data->latitude;
+            s_ema_lon   = data->longitude;
+            s_ema_alt   = data->altitude;
+            s_ema_speed = 0.0f;
+            s_ema_init  = true;
+        } else if (is_static && !s_pos_locked) {
+            // Outlier rejection
+            double dlat   = data->latitude  - s_ema_lat;
+            double dlon   = data->longitude - s_ema_lon;
+            double coslat = cos(s_ema_lat * M_PI / 180.0);
+            double dist_m = sqrt((dlat*dlat + dlon*dlon*coslat*coslat) * 111120.0 * 111120.0);
+            if (dist_m < cfg->gps_outlier_m) {
+                float a = cfg->gps_ema_alpha;
+                s_ema_lat = a * data->latitude  + (1.0 - a) * s_ema_lat;
+                s_ema_lon = a * data->longitude + (1.0 - a) * s_ema_lon;
+                s_ema_alt = a * data->altitude  + (1.0f - a) * s_ema_alt;
+            }
+        } else if (!is_static) {
+            // Moving — snap to raw
+            s_ema_lat = data->latitude;
+            s_ema_lon = data->longitude;
+            s_ema_alt = data->altitude;
         }
-    } else if (!is_static) {
-        // Moving — snap to raw
-        s_ema_lat = data->latitude;
-        s_ema_lon = data->longitude;
-        s_ema_alt = data->altitude;
     }
 
-    // Apply filtered or locked position
+    // Apply filtered or locked position — always executes even if quality gate failed.
     if (s_pos_locked) {
         data->latitude  = s_locked_lat;
         data->longitude = s_locked_lon;
         data->altitude  = s_locked_alt;
+        data->speed     = 0.0f;
+        s_ema_speed     = 0.0f;
     } else if (is_static) {
-        data->latitude  = (float)s_ema_lat;
-        data->longitude = (float)s_ema_lon;
-        data->altitude  = s_ema_alt;
+        if (s_ema_init) {
+            data->latitude  = (float)s_ema_lat;
+            data->longitude = (float)s_ema_lon;
+            data->altitude  = s_ema_alt;
+        }
+        // Always zero speed when IMU-confirmed static, regardless of GPS quality.
+        data->speed = 0.0f;
+        s_ema_speed = 0.0f;
+    } else {
+        // Moving — apply speed EMA only from quality fixes.
+        if (quality_ok) {
+            s_ema_speed = cfg->gps_ema_alpha * data->speed +
+                          (1.0f - cfg->gps_ema_alpha) * s_ema_speed;
+        }
+        data->speed = s_ema_speed;
     }
 }
 
 void gps_lock_position(void)
 {
     if (s_pos_locked) return;
+    if (!s_ema_init) return;   // refuse to lock before first quality fix — avoids 0,0 lock
     s_pos_locked  = true;
     s_locked_lat  = (float)s_ema_lat;
     s_locked_lon  = (float)s_ema_lon;
