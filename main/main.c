@@ -208,7 +208,7 @@ static esp_err_t log_to_csv(const gps_data_t *gps, const imu_data_t *imu)
              gps->latitude, gps->longitude, gps->altitude, speed,
              imu->accel_x, imu->accel_y, imu->accel_z,
              g_own_mac_str);
-
+    ESP_LOGI(TAG, "Logging GPS fix data: %s", row);     
     if (!sd_append_record(row)) return ESP_FAIL;
     last_lat = gps->latitude;
     last_lon = gps->longitude;
@@ -279,8 +279,7 @@ static void gps_logging_task(void *arg)
             imu_sample_count++;
         }
 
-        // Update shared state for sync task + webserver
-        g_current_gps = gps;
+        // Update shared imu state every cycle; gps state updated after filter below.
         g_current_imu = imu;
 
         // LCD housekeeping
@@ -292,6 +291,9 @@ static void gps_logging_task(void *arg)
             gps_filter_position(&gps, imu_static_last);
             log_gps = gps;
         }
+
+        // Share post-filter GPS so webserver and sync task see clean speed/position.
+        g_current_gps = gps;
 
         // Fast motion exit from Stage1/2/3 (runs every GPS_SAMPLE_PERIOD_MS)
         power_fast_motion_check(&gps, &imu, &log_interval_ms);
@@ -316,12 +318,20 @@ static void gps_logging_task(void *arg)
             imu_sample_count = 0;
         }
 
-        // Update static gate for next batch of per-fix EMA updates
-        imu_static_last = imu_is_static(&avg_imu) ||
-                          (gps.valid && gps.speed < config_get()->gps_static_kmh);
+        // Update static gate for next batch of per-fix EMA updates.
+        // Use IMU only — no GPS speed dependency (circular: filter zeroes speed
+        // only when imu_static_last is already true, which would make this check
+        // self-defeating if GPS speed is stale from a previous moving state).
+        imu_static_last = imu_is_static(&avg_imu);
 
         // Power state evaluation (handles stage transitions + position lock)
         power_evaluate(&gps, &avg_imu, &log_interval_ms);
+
+        // Safety net: if IMU confirms static, guarantee logged speed is zero
+        // even if the 5 Hz per-fix filter couldn't apply it this cycle.
+        if (imu_static_last) {
+            log_gps.speed = 0.0f;
+        }
 
         // Set timezone from GPS on first valid fix
         if (gps.valid && !timezone_set_from_gps) {
