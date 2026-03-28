@@ -71,6 +71,7 @@ I use the Freenove ESP32-WROVER-E dev board for this project. But I think if you
   - I2C Bus: I2C_NUM_0 (shared with IMU)
   - SDA: GPIO 18
   - SCL: GPIO 19
+  - **Optional — power-cut GPIO**: Connect the module's VCC pin directly to a free RTC-capable GPIO (e.g. GPIO 25) instead of the 3.3V rail. Set `RTC_PWR_GPIO` in `config.h` to that GPIO number. The firmware will drive it HIGH at boot (module on) and LOW before deep sleep (module switches to its coin-cell backup, ~0.84 µA). No extra components needed — the DS3231 draws well within the ESP32 GPIO source limit. See `config.h` comments for the MOSFET alternative if preferred.
 
 - **IMU**: MPU6050/MPU6500/MPU9250 6-Axis IMU
   - I2C Address: 0x69 (AD0 HIGH) or 0x68 (AD0 LOW)
@@ -113,6 +114,7 @@ If your ESP32 does not have a built in SD card reader, you can connect an extern
 | SD D0 | GPIO 2 | SD Card |
 | Button | GPIO 0 | BOOT button (built-in) |
 | Charger Detect | GPIO — (user-defined) | Optional: external power wake from deep sleep |
+| RTC Power | GPIO — (user-defined) | Optional: cut DS3231 VCC during deep sleep |
 
 ## Configuration
 
@@ -325,6 +327,18 @@ When in Stage 3, the device enters deep sleep. It can be woken by the following 
 
 > Note: `IMU_INT_GPIO` and `CHARGER_DET_GPIO` both use the ESP32 `ext0` wakeup source. Only one can be active at a time — `IMU_INT_GPIO` takes priority if both are set. If you need both simultaneously, wire the charger detect signal to a second RTC-capable GPIO and add it to the `ext1` bitmask in `power_enter_deep_sleep()`.
 
+**DS3231 VCC cut during deep sleep:**
+
+By default the DS3231 stays powered from 3.3V during deep sleep (~200 µA). To eliminate this, connect the module VCC to a spare RTC-capable GPIO and set `RTC_PWR_GPIO` in `config.h`:
+
+```c
+#define RTC_PWR_GPIO  25   // any RTC-capable GPIO: 0,2,4,12,13,14,15,25,26,27,32,33
+```
+
+The firmware drives the pin HIGH to power the module and LOW (held) before entering deep sleep. The DS3231 automatically falls back to its coin-cell backup and continues timekeeping at ~0.84 µA. On wake, `power_rtc_pwr_init()` releases the hold and powers the module back on before the I2C bus is initialised.
+
+No extra components are needed — connect module VCC directly to the GPIO. Optionally remove the power LED on the DS3231 breakout board (or its current-limiting resistor), which otherwise wastes 1–3 mA even during sleep.
+
 **Wiring the charger detect pin:**
 
 Set `CHARGER_DET_GPIO` in `config.h` to an available RTC-capable GPIO. GPIO 34–39 are input-only and ideal (no boot-strapping conflicts):
@@ -386,6 +400,7 @@ Sync files (`sync_data.csv`, `sync_merged.csv`) are managed automatically and de
 - Check I2C connections (SDA=18, SCL=19)
 - Verify I2C address is 0x68
 - Ensure pull-up resistors are present (usually internal)
+- If `RTC_PWR_GPIO` is set, confirm the GPIO is wired to the module VCC pin and the correct pin number is set in `config.h` — if it is misconfigured the module will not receive power
 
 ### MPU6050/6500/9250 Not Found
 - Check I2C connections (shared with RTC on Bus 0)
@@ -419,7 +434,7 @@ Sync files (`sync_data.csv`, `sync_merged.csv`) are managed automatically and de
 The system is designed for portable operation:
 - GPS: ~50mA active
 - IMU: ~3.9mA active
-- RTC: ~200uA (continues on backup battery)
+- RTC: ~200 µA active; ~0.84 µA on coin-cell backup during deep sleep (requires `RTC_PWR_GPIO` wiring)
 - LCD: ~30mA with backlight, ~5mA without
 - SD Card: ~100mA during writes, <1mA idle
 - ESP32: ~240mA active, can be reduced with sleep modes

@@ -439,6 +439,10 @@ void app_main(void)
     config_init();
     const tracker_config_t *cfg = config_get();
 
+    // DS3231 power — must precede I2C so the module is on the bus at init time.
+    // No-op if RTC_PWR_GPIO == 0 (feature disabled).
+    power_rtc_pwr_init();
+
     // I2C buses
     ESP_ERROR_CHECK(i2c_init_buses());
     ESP_LOGI(TAG, "I2C Bus 0 (IMU/RTC): SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);

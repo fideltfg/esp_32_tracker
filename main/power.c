@@ -51,6 +51,20 @@ static void log_transition(power_state_t from, power_state_t to)
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+void power_rtc_pwr_init(void)
+{
+#if RTC_PWR_GPIO > 0
+    rtc_gpio_hold_dis((gpio_num_t)RTC_PWR_GPIO);  // release any hold from previous sleep
+    rtc_gpio_init((gpio_num_t)RTC_PWR_GPIO);
+    rtc_gpio_set_direction((gpio_num_t)RTC_PWR_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_pullup_dis((gpio_num_t)RTC_PWR_GPIO);
+    rtc_gpio_pulldown_dis((gpio_num_t)RTC_PWR_GPIO);
+    rtc_gpio_set_level((gpio_num_t)RTC_PWR_GPIO, 1);  // HIGH → DS3231 on VCC
+    vTaskDelay(pdMS_TO_TICKS(5));  // allow DS3231 VCC to settle before I2C access
+    ESP_LOGI(TAG, "DS3231 VCC on (GPIO %d HIGH)", RTC_PWR_GPIO);
+#endif
+}
+
 void power_init(void)
 {
     const tracker_config_t *cfg = config_get();
@@ -207,6 +221,14 @@ void power_enter_deep_sleep(void)
 
     // Button as secondary wake source (active LOW)
     esp_sleep_enable_ext1_wakeup(1ULL << BUTTON_GPIO, ESP_EXT1_WAKEUP_ALL_LOW);
+
+#if RTC_PWR_GPIO > 0
+    // Cut VCC to the DS3231 module — it falls back to VBAT backup (~0.84 µA).
+    // Hold the GPIO LOW through deep sleep so VCC stays cut.
+    rtc_gpio_set_level((gpio_num_t)RTC_PWR_GPIO, 0);
+    rtc_gpio_hold_en((gpio_num_t)RTC_PWR_GPIO);
+    ESP_LOGI(TAG, "DS3231 VCC cut (GPIO %d LOW, held)", RTC_PWR_GPIO);
+#endif
 
     esp_deep_sleep_start();
 }

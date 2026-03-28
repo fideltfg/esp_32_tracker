@@ -7,6 +7,14 @@
 #include <stdint.h>
 
 /**
+ * @brief Power on the DS3231 RTC module via GPIO-controlled P-MOSFET.
+ *        Must be called BEFORE I2C bus init so the module is on the bus.
+ *        Also releases any deep-sleep GPIO hold from the previous sleep cycle.
+ *        No-op if RTC_PWR_GPIO == 0.
+ */
+void power_rtc_pwr_init(void);
+
+/**
  * @brief Initialise power manager.
  */
 void power_init(void);

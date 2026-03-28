@@ -63,6 +63,20 @@
 // Set to 0 if not wired — deep sleep will fall back to timer-based wake.
 #define IMU_INT_GPIO     0
 
+// ─── DS3231 RTC module power-cut (deep sleep) ────────────────────────────────
+// Removes VCC from the DS3231 module during deep sleep so it falls back to
+// its coin-cell VBAT backup (~0.84 µA) while still keeping accurate time.
+//
+// SIMPLEST — no extra components (direct GPIO drive):
+//   Connect DS3231 module VCC directly to an RTC-capable GPIO.
+//   The DS3231 draws ~200 µA–3.5 mA; well within the ESP32 GPIO 40 mA limit.
+//   GPIO HIGH = module powered.  GPIO LOW (held in sleep) = off.
+//   Optional: remove the module's power LED / its resistor (saves 1–3 mA).
+//
+// Must be an RTC-capable GPIO (0,2,4,12,13,14,15,25,26,27,32,33).
+// Set to 0 to disable (module always powered from 3V3).
+#define RTC_PWR_GPIO  0   // e.g. 25 — set after wiring
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 2 — Protocol Constants & File Paths (compile-time only)
 // ═════════════════════════════════════════════════════════════════════════════
