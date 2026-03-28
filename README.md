@@ -25,7 +25,7 @@ This project is in active development and in the final stages of prototyping bef
 - **HTTP Upload**: CSV-to-JSON conversion and chunked POST to a configurable server endpoint with backup re-upload
 - **ESP-NOW Peer Sync**: When stationary, discovers nearby devices and exchanges CSV data bidirectionally with per-peer watermark tracking
 - **Motion Detection**: GPS speed and IMU acceleration/gyroscope data fused to determine stationary state
-- **Progressive Power Management**: Four-stage power scaling (Moving → Stage 1 → Stage 2 → Stage 3) that progressively reduces logging frequency, with deep sleep at Stage 3. Wake sources: IMU motion interrupt, button press, timer, or external power connection (charger detect). ESP-NOW peer sync remains active in all stages.
+- **Progressive Power Management**: Four-stage power scaling (Moving → Stage 1 → Stage 2 → Stage 3) that progressively reduces logging frequency, with deep sleep at Stage 3. Wake sources: IMU motion interrupt, button press, timer, or external power connection (charger detect). ESP-NOW peer sync remains active in all stages except 3.
 - **NVS-Backed Configuration**: All tunable parameters (WiFi APs, thresholds, intervals, upload URL, timezone) stored in NVS, editable at runtime via web UI, with factory reset support
 - **OTA Firmware Updates**: Upload new firmware via the web interface
 
