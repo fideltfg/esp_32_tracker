@@ -25,7 +25,7 @@ This project is in active development and in the final stages of prototyping bef
 - **HTTP Upload**: CSV-to-JSON conversion and chunked POST to a configurable server endpoint with backup re-upload
 - **ESP-NOW Peer Sync**: When stationary, discovers nearby devices and exchanges CSV data bidirectionally with per-peer watermark tracking
 - **Motion Detection**: GPS speed and IMU acceleration/gyroscope data fused to determine stationary state
-- **Progressive Power Management**: Four-stage power scaling (Moving → Stage 1 → Stage 2 → Stage 3) that progressively reduces logging frequency, with deep sleep and IMU wake-on-motion at Stage 3. ESP-NOW peer sync remains active in all stages.
+- **Progressive Power Management**: Four-stage power scaling (Moving → Stage 1 → Stage 2 → Stage 3) that progressively reduces logging frequency, with deep sleep at Stage 3. Wake sources: IMU motion interrupt, button press, timer, or external power connection (charger detect). ESP-NOW peer sync remains active in all stages.
 - **NVS-Backed Configuration**: All tunable parameters (WiFi APs, thresholds, intervals, upload URL, timezone) stored in NVS, editable at runtime via web UI, with factory reset support
 - **OTA Firmware Updates**: Upload new firmware via the web interface
 
@@ -112,6 +112,7 @@ If your ESP32 does not have a built in SD card reader, you can connect an extern
 | SD CLK | GPIO 14 | SD Card |
 | SD D0 | GPIO 2 | SD Card |
 | Button | GPIO 0 | BOOT button (built-in) |
+| Charger Detect | GPIO — (user-defined) | Optional: external power wake from deep sleep |
 
 ## Configuration
 
@@ -310,6 +311,37 @@ The system implements progressive power management to conserve battery and reduc
 - All thresholds are configurable in `sync_config.h` (`LOG_INTERVAL_*`, `STATIC_STAGE*_THRESHOLD_MS`)
 
 This approach ensures high-resolution tracking when moving while dramatically reducing power consumption and SD card wear when parked, all while maintaining the ability to sync with passing devices via ESP-NOW.
+
+### Deep Sleep Wake Sources
+
+When in Stage 3, the device enters deep sleep. It can be woken by the following sources (evaluated in priority order):
+
+| Wake Source | Trigger | Config |
+|-------------|---------|--------|
+| **IMU motion interrupt** | IMU_INT_GPIO pin goes HIGH | `IMU_INT_GPIO` in `config.h` |
+| **External power / charger detect** | CHARGER_DET_GPIO pin goes HIGH | `CHARGER_DET_GPIO` in `config.h` |
+| **Timer** | Fallback: wakes every 30 minutes | 
+| **Button** | BOOT button (GPIO 0) held LOW | Always active |
+
+> Note: `IMU_INT_GPIO` and `CHARGER_DET_GPIO` both use the ESP32 `ext0` wakeup source. Only one can be active at a time — `IMU_INT_GPIO` takes priority if both are set. If you need both simultaneously, wire the charger detect signal to a second RTC-capable GPIO and add it to the `ext1` bitmask in `power_enter_deep_sleep()`.
+
+**Wiring the charger detect pin:**
+
+Set `CHARGER_DET_GPIO` in `config.h` to an available RTC-capable GPIO. GPIO 34–39 are input-only and ideal (no boot-strapping conflicts):
+
+```c
+#define CHARGER_DET_GPIO 34   // example — match to your wiring
+```
+
+Suitable signal sources:
+
+| Source | Signal | Notes |
+|--------|--------|-------|
+| USB VBUS (5 V) | Resistor divider to ≤3.3 V | 100 kΩ / 68 kΩ gives ~3.06 V |
+| TP4056 `CHRG` pin | LOW when charging | Needs NPN inverter or use `ext1` ALL_LOW |
+| IP5306 power-good / `EN` | HIGH when power applied | Direct connection works |
+
+On wake, `power_check_wake_reason()` logs `"Woke from deep sleep: charger/external power"` so you can confirm the source via the serial monitor.
 
 ### LCD Display Modes
 

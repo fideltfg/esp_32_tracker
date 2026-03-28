@@ -24,6 +24,7 @@ static EventGroupHandle_t s_event_group = NULL;
 static int                s_retry_count  = 0;
 static int                s_max_retries  = 3;
 static bool               s_started      = false;
+static bool               s_connecting   = false;  // true only while try_connect() is waiting
 
 // ── Event handler (the ONLY WiFi event handler in the app) ───────────────────
 
@@ -32,6 +33,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 {
     if (base == WIFI_EVENT) {
         if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            // Drop stale events that arrive after try_connect() has already
+            // given up and returned.  Without this guard, leftover disconnect
+            // events from AP-B burn through the retry budget of AP-A before
+            // it has even had a chance to connect.
+            if (!s_connecting) {
+                ESP_LOGD(TAG, "Disconnect ignored (not in a connect attempt)");
+                return;
+            }
+            wifi_event_sta_disconnected_t *disc =
+                (wifi_event_sta_disconnected_t *)event_data;
+            // Wrong credentials will never succeed — fail immediately instead
+            // of wasting the entire retry budget.
+            if (disc->reason == WIFI_REASON_AUTH_FAIL ||
+                disc->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) {
+                ESP_LOGW(TAG, "Auth failure (reason %d) — not retrying", disc->reason);
+                xEventGroupSetBits(s_event_group, WIFI_FAIL_BIT);
+                return;
+            }
             if (s_retry_count < s_max_retries) {
                 esp_wifi_connect();
                 s_retry_count++;
@@ -85,6 +104,12 @@ void wifi_mgr_init(void)
 // Try connecting to a specific SSID/password
 static bool try_connect(const char *ssid, const char *password)
 {
+    // Silence the event handler before issuing the explicit disconnect so
+    // the resulting DISCONNECTED event is not mistaken for a failed attempt
+    // on the new AP (and does not consume its retry budget).
+    s_connecting = false;
+    esp_wifi_disconnect();
+
     xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     s_retry_count = 0;
 
@@ -94,18 +119,21 @@ static bool try_connect(const char *ssid, const char *password)
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    s_connecting = true;
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(s_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                             pdFALSE, pdFALSE,
                                             pdMS_TO_TICKS(15000));
+    s_connecting = false;
     return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
 bool wifi_mgr_connect(void)
 {
     const tracker_config_t *cfg = config_get();
+    int best_cfg_idx = -1;  // index of AP tried in Phase 1 (skip it in Phase 2)
     if (cfg->wifi_ap_count == 0) {
         ESP_LOGW(TAG, "No WiFi APs configured");
         return false;
@@ -130,7 +158,7 @@ bool wifi_mgr_connect(void)
         ESP_LOGI(TAG, "Scan found %d AP(s)", ap_num);
 
         // Find the configured AP with the strongest RSSI
-        int best_cfg_idx = -1;
+        best_cfg_idx = -1;
         int8_t best_rssi = -127;
 
         for (int s = 0; s < ap_num; s++) {
@@ -162,6 +190,7 @@ bool wifi_mgr_connect(void)
 
     // ── Phase 2: Fallback — iterate config list in order ─────────────────────
     for (int i = 0; i < cfg->wifi_ap_count; i++) {
+        if (i == best_cfg_idx) continue;  // already tried this AP in Phase 1
         ESP_LOGI(TAG, "Trying AP %d/%d: \"%s\"", i + 1, cfg->wifi_ap_count,
                  cfg->wifi_aps[i].ssid);
         if (try_connect(cfg->wifi_aps[i].ssid, cfg->wifi_aps[i].password)) {
@@ -177,6 +206,7 @@ bool wifi_mgr_connect(void)
 
 void wifi_mgr_disconnect(void)
 {
+    s_connecting = false;
     esp_wifi_disconnect();
 }
 

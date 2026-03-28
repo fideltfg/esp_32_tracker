@@ -121,6 +121,12 @@ static esp_err_t handle_root(httpd_req_t *req)
     emit_file_row(req, "connections.csv", CONNECTIONS_LOG_FILE);
     httpd_resp_sendstr_chunk(req, "</table>");
 
+    // Debug log
+    httpd_resp_sendstr_chunk(req, "<h2>Debug Log</h2><table>");
+    emit_file_row(req, "debug.log (current)", DEBUG_LOG_FILE);
+    emit_file_row(req, "debug_old.log (previous)", DEBUG_LOG_OLD_FILE);
+    httpd_resp_sendstr_chunk(req, "</table>");
+
     // Actions
     httpd_resp_sendstr_chunk(req,
         "<h2>Actions</h2>"
@@ -132,6 +138,9 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<form method='POST' action='/clear' style='display:inline' "
         "onsubmit=\"return confirm('Clear ALL data files?');\">"
         "<button class='btn danger'>Clear all data</button></form>"
+        "<form method='POST' action='/clear_log' style='display:inline;margin-left:8px' "
+        "onsubmit=\"return confirm('Delete debug log files?');\">"
+        "<button class='btn warn'>Clear debug log</button></form>"
         "<form method='POST' action='/reboot' style='display:inline;margin-left:16px' "
         "onsubmit=\"return confirm('Reboot the device?');\">"
         "<button class='btn warn'>Reboot</button></form>");
@@ -755,12 +764,41 @@ static esp_err_t handle_reset_config(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── POST /api/test_sleep — Force deep sleep immediately (test only) ──────────
+// Allows manual testing of the deep sleep wake sources without waiting for
+// the power state machine to reach Stage 3 naturally.
+// Wake: connect CHARGER_DET_GPIO (or IMU_INT_GPIO) to 3.3 V, or press BOOT.
+
+#if CHARGER_DET_GPIO > 0 || IMU_INT_GPIO > 0
+static esp_err_t handle_test_sleep(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"entering deep sleep\"}");
+    vTaskDelay(pdMS_TO_TICKS(200));   // let the response flush before sleeping
+    power_enter_deep_sleep();
+    return ESP_OK;   // unreachable — device sleeps above
+}
+#endif
+
+// ── POST /clear_log — Delete debug log files ─────────────────────────────────
+
+static esp_err_t handle_clear_log(httpd_req_t *req)
+{
+    remove(DEBUG_LOG_FILE);
+    remove(DEBUG_LOG_OLD_FILE);
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
+}
+
 // ── Server start / stop ──────────────────────────────────────────────────────
 
 httpd_handle_t webserver_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 19;
     config.stack_size = 8192;
     httpd_handle_t server = NULL;
 
@@ -784,6 +822,10 @@ httpd_handle_t webserver_start(void)
         { "/api/config",    HTTP_POST, handle_api_config_post, NULL },
         { "/api/reset_config", HTTP_POST, handle_reset_config, NULL },
         { "/reboot",          HTTP_POST, handle_reboot,        NULL },
+        { "/clear_log",       HTTP_POST, handle_clear_log,     NULL },
+#if CHARGER_DET_GPIO > 0 || IMU_INT_GPIO > 0
+        { "/api/test_sleep",  HTTP_POST, handle_test_sleep,    NULL },
+#endif
         // Pages
         { "/map",           HTTP_GET,  handle_map,           NULL },
         { "/config",        HTTP_GET,  handle_config_page,   NULL },

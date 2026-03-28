@@ -39,6 +39,7 @@
 #include "webserver.h"
 #include "sd_storage.h"
 #include "espnow_sync.h"
+#include "serial_log.h"
 
 static const char *TAG = "GPS_TRACKER";
 
@@ -472,6 +473,9 @@ void app_main(void)
     if (!sd_init()) {
         ESP_LOGE(TAG, "Sync SD init failed");
     }
+
+    // Start mirroring serial output to SD card
+    serial_log_init();
 
     // MAC suffix for CSV records
     {

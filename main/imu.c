@@ -90,7 +90,8 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus)
     }
 
     // Configure: ±2g accel, ±250°/s gyro, 125 Hz sample, DLPF ~44 Hz
-    write_reg(0x1C, 0x00); // accel ±2g
+    write_reg(0x6C, 0x00); // PWR_MGMT_2: all axes active (clear standby from sleep mode)
+    write_reg(0x1C, 0x00); // ACCEL_CONFIG: ±2g, HPF off (clear sleep-mode HPF setting)
     write_reg(0x1B, 0x00); // gyro ±250°/s
     write_reg(0x19, 0x07); // sample rate divider → 125 Hz
     write_reg(0x1A, 0x03); // DLPF ~44 Hz
@@ -171,3 +172,39 @@ bool imu_is_static(const imu_data_t *data)
 
 bool imu_is_available(void) { return s_dev != NULL; }
 uint8_t imu_get_address(void) { return s_addr; }
+
+void imu_prepare_sleep(void)
+{
+    if (!s_dev) return;
+
+    // 1. Disable all interrupts and clear any latched INT_STATUS.
+    write_reg(0x38, 0x00);          // INT_ENABLE = 0
+    uint8_t status = 0;
+    read_regs(0x3A, &status, 1);    // clears latch on read
+
+    // 2. INT pin: active HIGH, push-pull, 50 µs pulse, clears on INT_STATUS read.
+    write_reg(0x37, 0x00);          // INT_PIN_CFG default (push-pull, active high)
+
+    // 3. Enable accel high-pass filter — REQUIRED for motion detection.
+    //    Without this the motion comparator has no reference and never fires.
+    //    bits[4:3]=00 → ±2g range, bits[2:0]=010 → HPF 2.5 Hz (catches slower movements).
+    write_reg(0x1C, 0x02);          // ACCEL_CONFIG: ±2g + HPF 2.5 Hz
+
+    // 4. Motion threshold (2 mg/LSB) and debounce duration.
+    //    Lower threshold = more sensitive.  Raise toward 10 if false wakes occur.
+    //    1=2mg, 2=4mg, 5=10mg, 10=20mg
+    write_reg(0x1F, 2);             // MOT_THR = 4 mg
+    write_reg(0x20, 1);             // MOT_DUR = 1 ms
+
+    // 5. Enable only the motion interrupt.
+    write_reg(0x38, 0x40);          // INT_ENABLE: MOT_EN = 1
+
+    // 6. PWR_MGMT_2: 40 Hz cycle rate (bits[7:6]=11), gyros in standby (bits[2:0]=111).
+    //    40 Hz means the accel is sampled every 25 ms — quick enough to catch a tap.
+    write_reg(0x6C, 0xC7);
+
+    // 7. PWR_MGMT_1: CYCLE=1 (bit5), SLEEP=0, TEMP_DIS=1 (bit3), internal clock.
+    write_reg(0x6B, 0x28);
+
+    ESP_LOGI(TAG, "IMU in low-power cycle mode for motion wake (INT_STATUS was 0x%02X)", status);
+}

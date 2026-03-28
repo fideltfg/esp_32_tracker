@@ -84,3 +84,5 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 main/config.h
 build_output.txt
+Instructions.md
+media/esp32-wrover_datasheet_en.pdf

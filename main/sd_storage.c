@@ -50,7 +50,7 @@ bool sd_init(void)
 
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = false,
-        .max_files              = 5,   // data.csv(r) + data.csv(a) + merge_tmp + headroom
+        .max_files              = 6,   // data.csv(r) + data.csv(a) + merge_tmp + debug.log + headroom
         .allocation_unit_size   = 16 * 1024,
     };
 

@@ -41,3 +41,12 @@ bool imu_is_available(void);
  * @brief Return the detected I2C address (0x68 or 0x69), or 0 if not found.
  */
 uint8_t imu_get_address(void);
+
+/**
+ * @brief Prepare IMU for deep sleep.
+ *        Disables all interrupt outputs (INT_ENABLE = 0) and reads INT_STATUS
+ *        to clear any latched interrupt, ensuring the INT pin is LOW before
+ *        esp_deep_sleep_start() is called.  Without this, a latched data-ready
+ *        interrupt keeps the pin HIGH and the device wakes immediately.
+ */
+void imu_prepare_sleep(void);
