@@ -132,6 +132,10 @@ static bool try_connect(const char *ssid, const char *password)
 
 bool wifi_mgr_connect(void)
 {
+    if (wifi_mgr_needs_provisioning()) {
+        ESP_LOGW(TAG, "No valid WiFi credentials — skipping connect (provisioning mode active)");
+        return false;
+    }
     const tracker_config_t *cfg = config_get();
     int best_cfg_idx = -1;  // index of AP tried in Phase 1 (skip it in Phase 2)
     if (cfg->wifi_ap_count == 0) {
@@ -228,4 +232,35 @@ void wifi_mgr_get_ip_str(char *buf, int buf_len)
     } else {
         strncpy(buf, "0.0.0.0", buf_len);
     }
+}
+
+// ── Provisioning ─────────────────────────────────────────────────────────────
+
+bool wifi_mgr_needs_provisioning(void)
+{
+    const tracker_config_t *cfg = config_get();
+    return (cfg->wifi_ap_count == 0 ||
+            cfg->wifi_aps[0].ssid[0] == '\0' ||
+            cfg->wifi_aps[0].ssid[0] == '<');
+}
+
+void wifi_mgr_start_provisioning_ap(const char *ap_ssid)
+{
+    if (!s_started) return;
+
+    esp_netif_create_default_wifi_ap();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .max_connection = 4,
+            .authmode       = WIFI_AUTH_OPEN,
+        },
+    };
+    strncpy((char *)ap_cfg.ap.ssid, ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
+    ap_cfg.ap.ssid_len = (uint8_t)strnlen(ap_ssid, sizeof(ap_cfg.ap.ssid));
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_LOGI(TAG, "Provisioning AP: SSID=\"%s\" — connect and go to http://192.168.4.1/provision",
+             ap_ssid);
 }

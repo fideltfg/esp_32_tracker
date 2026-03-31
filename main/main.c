@@ -498,6 +498,14 @@ void app_main(void)
     // WiFi stack init (fast, non-blocking — connect is handled by the sync task)
     wifi_mgr_init();
 
+    // If no valid credentials exist (factory reset / first boot), start a SoftAP
+    // so the user can connect and set up WiFi via http://192.168.4.1/provision
+    if (wifi_mgr_needs_provisioning()) {
+        char prov_ssid[32];
+        snprintf(prov_ssid, sizeof(prov_ssid), "ESP32-Tracker-%s", g_own_mac_str);
+        wifi_mgr_start_provisioning_ap(prov_ssid);
+    }
+
     // Web server
     server = webserver_start();
 

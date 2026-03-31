@@ -27,6 +27,7 @@ This project is in active development and in the final stages of prototyping bef
 - **Motion Detection**: GPS speed and IMU acceleration/gyroscope data fused to determine stationary state
 - **Progressive Power Management**: Four-stage power scaling (Moving → Stage 1 → Stage 2 → Stage 3) that progressively reduces logging frequency, with deep sleep at Stage 3. Wake sources: IMU motion interrupt, button press, timer, or external power connection (charger detect). ESP-NOW peer sync remains active in all stages except 3.
 - **NVS-Backed Configuration**: All tunable parameters (WiFi APs, thresholds, intervals, upload URL, timezone) stored in NVS, editable at runtime via web UI, with factory reset support
+- **WiFi Provisioning**: After a factory reset the device broadcasts an open access point (`ESP32-Tracker-XXXX`); connecting to it and opening `http://192.168.4.1` presents a setup page to enter your SSID and password without reflashing
 - **OTA Firmware Updates**: Upload new firmware via the web interface
 
 ## Architecture
@@ -118,7 +119,7 @@ If your ESP32 does not have a built in SD card reader, you can connect an extern
 
 ## Configuration
 
-### Initial Setup
+### Initial Setup.
 
 Copy the example config and fill in your credentials:
 
@@ -137,6 +138,18 @@ Edit `main/sync_config.h` with your WiFi credentials and upload endpoint. The fi
 // Upload endpoint
 #define DEFAULT_UPLOAD_URL        "https://<server>/api/esp/upload"
 ```
+
+### WiFi Provisioning (After Factory Reset)
+
+If the stored WiFi credentials are blank or contain placeholder values (e.g. after calling `/api/reset_config`), the device enters **provisioning mode** at boot instead of attempting a normal WiFi connection.
+
+1. The ESP32 starts a **soft AP** with SSID `ESP32-Tracker-XXXX` (XXXX = last 4 hex digits of the device MAC address). The AP is open (no password).
+2. Connect your phone or laptop to that network.
+3. Open a browser to **`http://192.168.4.1`** — the device redirects you to the setup page automatically.
+4. Enter your WiFi SSID and password and tap **Save**.
+5. The device saves the credentials to NVS and reboots into normal STA mode.
+
+Provisioning mode is detected automatically — no reflashing or serial access is required. Once valid credentials are stored, the provisioning AP is not started again.
 
 ### Runtime Configuration
 
@@ -207,7 +220,8 @@ NOTE: The service the data is uploaded to is not part of this project. You will 
 
 | Page | Path | Description |
 |------|------|-------------|
-| Dashboard | `/` | File listing with sizes, backup management |
+| Dashboard | `/` | File listing with sizes, backup management (redirects to Provision page if WiFi is not configured) |
+| Provision | `/provision` | WiFi setup form — only served while in provisioning mode |
 | Map | `/map` | Map visualisation of GPS data |
 | Config | `/config` | Runtime configuration editor |
 | OTA | `/ota` | Firmware upload page |
@@ -226,6 +240,7 @@ NOTE: The service the data is uploaded to is not part of this project. You will 
 | `/api/config` | GET | Current configuration as JSON |
 | `/api/config` | POST | Update configuration values |
 | `/api/reset_config` | POST | Reset all config to compile-time defaults |
+| `/provision` | POST | Save WiFi credentials (provisioning mode only) and reboot |
 | `/ota` | POST | Upload and flash new firmware |
 
 ## Building and Flashing
@@ -272,7 +287,7 @@ The firmware runs two pinned FreeRTOS tasks:
 7. MAC suffix derived for CSV record identification
 8. GPS UART initialised
 9. Power manager initialised; deep sleep wake reason checked
-10. WiFi connected (strongest AP); NTP time sync started
+10. **WiFi credentials check** — if credentials are blank or placeholder, provisioning mode is started (see [WiFi Provisioning](#wifi-provisioning-after-factory-reset)); otherwise connects to the strongest configured AP and starts NTP sync
 11. HTTP server started
 12. GPS logging task (Core 1) and sync state machine task (Core 0) launched
 
@@ -418,6 +433,13 @@ Sync files (`sync_data.csv`, `sync_merged.csv`) are managed automatically and de
 - Verify SSID and password in `sync_config.h`
 - Ensure router is in range
 - Check MAC address is not filtered
+
+### WiFi Provisioning Not Working
+- Confirm the device is in provisioning mode: the serial monitor will print `Starting provisioning AP` and the SSID `ESP32-Tracker-XXXX`
+- Make sure you are connected to the `ESP32-Tracker-XXXX` network before opening the browser
+- Use `http://192.168.4.1` — HTTPS and mDNS are not available in provisioning mode
+- If the page does not load, try disabling mobile data on your phone so traffic is forced over the ESP32 AP
+- To re-enter provisioning mode at any time, call `POST /api/reset_config` via the web UI, then reboot the device
 
 ### ESP-NOW Sync Not Working
 - Both devices must be on the same WiFi channel (`ESPNOW_CHANNEL` in `sync_config.h`)

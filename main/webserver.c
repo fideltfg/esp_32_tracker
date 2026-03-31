@@ -102,7 +102,16 @@ static esp_err_t handle_static_file(httpd_req_t *req)
 
 // ── GET / — Dashboard ────────────────────────────────────────────────────────
 
-static esp_err_t handle_root(httpd_req_t *req) { return serve_spiffs(req, "index.html"); }
+static esp_err_t handle_root(httpd_req_t *req)
+{
+    if (wifi_mgr_needs_provisioning()) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/provision");
+        httpd_resp_sendstr(req, "");
+        return ESP_OK;
+    }
+    return serve_spiffs(req, "index.html");
+}
 
 // ── GET /download ────────────────────────────────────────────────────────────
 
@@ -637,6 +646,99 @@ static esp_err_t handle_api_files(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── GET /provision — WiFi setup page (shown after factory reset) ─────────────
+
+static const char PROVISION_HTML[] =
+    "<!DOCTYPE html><html><head><title>WiFi Setup</title>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>"
+    "body{font-family:monospace;padding:20px;max-width:420px;margin:0 auto}"
+    "h2{border-bottom:1px solid #ccc;padding-bottom:4px}"
+    "label{display:block;margin:8px 0 2px;font-size:13px;color:#555}"
+    "input[type=text],input[type=password]{width:100%;padding:8px;margin-bottom:10px;"
+    "box-sizing:border-box;font-family:monospace}"
+    ".btn{background:#2980b9;color:#fff;border:none;padding:10px;width:100%;"
+    "cursor:pointer;font-family:monospace;font-size:14px}"
+    "</style></head><body>"
+    "<h2>WiFi Setup</h2>"
+    "<p>Connect this device to your WiFi network.</p>"
+    "<form method='POST' action='/provision'>"
+    "<label>Network Name (SSID)</label>"
+    "<input type='text' name='ssid' required placeholder='Your WiFi network name'>"
+    "<label>Password</label>"
+    "<input type='password' name='pass' placeholder='Leave blank for open networks'>"
+    "<input class='btn' type='submit' value='Save and Connect'>"
+    "</form></body></html>";
+
+static esp_err_t handle_provision_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, PROVISION_HTML);
+    return ESP_OK;
+}
+
+static esp_err_t handle_provision_post(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 512) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int len = httpd_req_recv(req, body, total);
+    if (len <= 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    char ssid[CONFIG_SSID_MAX] = {0};
+    char pass[CONFIG_PASS_MAX] = {0};
+
+    if (httpd_query_key_value(body, "ssid", ssid, sizeof(ssid)) != ESP_OK || ssid[0] == '\0') {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
+        return ESP_FAIL;
+    }
+    url_decode(ssid);
+
+    if (httpd_query_key_value(body, "pass", pass, sizeof(pass)) == ESP_OK)
+        url_decode(pass);
+
+    free(body);
+
+    // Save as the sole AP entry, replacing any placeholder defaults
+    tracker_config_t new_cfg = *config_get();
+    strncpy(new_cfg.wifi_aps[0].ssid,     ssid, CONFIG_SSID_MAX - 1);
+    strncpy(new_cfg.wifi_aps[0].password, pass, CONFIG_PASS_MAX - 1);
+    new_cfg.wifi_aps[0].ssid[CONFIG_SSID_MAX - 1]     = '\0';
+    new_cfg.wifi_aps[0].password[CONFIG_PASS_MAX - 1] = '\0';
+    new_cfg.wifi_ap_count = 1;
+    config_update(&new_cfg);
+
+    ESP_LOGI(TAG, "Provisioning: saved SSID \"%s\" — rebooting", ssid);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req,
+        "<!DOCTYPE html><html><head><title>Saved</title>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>body{font-family:monospace;padding:20px;max-width:420px;margin:0 auto}</style>"
+        "</head><body><h2>Saved!</h2>"
+        "<p>Credentials saved. The device is rebooting and will connect to your network.<br>"
+        "You can then reconnect to your WiFi and access the device dashboard.</p>"
+        "</body></html>");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
 // ── Server start / stop ──────────────────────────────────────────────────────
 
 httpd_handle_t webserver_start(void)
@@ -655,7 +757,7 @@ httpd_handle_t webserver_start(void)
         ESP_LOGI(TAG, "SPIFFS mounted at /spiffs");
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 21;
+    config.max_uri_handlers = 23;
     config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_handle_t server = NULL;
@@ -690,6 +792,9 @@ httpd_handle_t webserver_start(void)
         { "/config",        HTTP_GET,  handle_config_page,   NULL },
         { "/ota",           HTTP_GET,  handle_ota_page,      NULL },
         { "/ota",           HTTP_POST, handle_ota_upload,    NULL },
+        // Provisioning
+        { "/provision",     HTTP_GET,  handle_provision_get,  NULL },
+        { "/provision",     HTTP_POST, handle_provision_post, NULL },
         // Wildcard fallback: serves static files (CSS, JS, etc.) from SPIFFS
         { "/*",             HTTP_GET,  handle_static_file,   NULL },
     };
