@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SledMesh Tracker v2</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:monospace;padding:16px;max-width:700px;margin:0 auto}
+    h1{margin:0;padding:0}
+    .page-hdr{display:flex;align-items:center;justify-content:space-between;
+      border-bottom:1px solid #ccc;padding-bottom:8px;flex-wrap:wrap;gap:8px;margin-bottom:4px}
+    h2{margin-top:24px;color:#444}
+    table{border-collapse:collapse;width:100%}
+    td{padding:4px 0}
+    a{color:#0066cc}
+    #fn-menu{font-family:monospace;font-size:13px;padding:6px 10px;
+      border:1px solid #aaa;border-radius:3px;cursor:pointer;background:#fff}
+  </style>
+</head>
+<body>
+  <div class="page-hdr">
+    <h1>SledMesh Tracker v2</h1>
+    <select id="fn-menu" onchange="runAct(this)">
+      <option value="">Actions...</option>
+      <option value="/reupload_bak">Upload From Backups</option>
+      <option value="/clear_bak" data-confirm="Delete .bak files?">Clear backups</option>
+      <option value="/clear_log" data-confirm="Delete debug log?">Clear debug log</option>
+      <option value="/clear" data-confirm="Clear ALL data?">Clear all data</option>
+      <option value="/reboot" data-confirm="Reboot the device?" data-reboot="1">Reboot</option>
+      <option value="/api/reset_config" data-confirm="Reset ALL settings to factory defaults?">Factory Reset</option>
+    </select>
+  </div>
+  <div id="act-msg" style="margin:4px 0 8px;font-weight:bold"></div>
+  <p style="color:#555;margin-top:0">
+    MAC: <b id="mac">...</b> |
+    <a href="/map">Live Map</a> |
+    <a href="/config">Config</a> |
+    <a href="/ota">OTA Update</a>
+  </p>
+  <div id="files"><p style="color:#888">Loading files...</p></div>
+
+  <script>
+    fetch('/api/system').then(function(r){ return r.json(); }).then(function(s){
+      document.getElementById('mac').textContent = s.mac || '??';
+    }).catch(function(){});
+
+    fetch('/api/files').then(function(r){ return r.json(); }).then(function(data){
+      var html = '';
+      (data.sections || []).forEach(function(sec){
+        html += '<h2>' + sec.title + '</h2><table>';
+        if (!sec.files || sec.files.length === 0) {
+          html += '<tr><td style="color:#888">No files</td></tr>';
+        } else {
+          sec.files.forEach(function(f){
+            html += '<tr>' +
+              '<td><a href="/download?path=' + encodeURIComponent(f.path) + '">' + f.name + '</a></td>' +
+              '<td style="padding-left:16px;color:#888">' + f.size + ' B</td>' +
+              '</tr>';
+          });
+        }
+        html += '</table>';
+      });
+      document.getElementById('files').innerHTML = html || '<p>No files found.</p>';
+    }).catch(function(){
+      document.getElementById('files').innerHTML = '<p style="color:red">Failed to load file list.</p>';
+    });
+
+    function runAct(sel) {
+      var opt = sel.options[sel.selectedIndex];
+      var url = sel.value;
+      var msg = opt.getAttribute('data-confirm');
+      var reboot = opt.getAttribute('data-reboot');
+      sel.value = '';
+      if (!url) return;
+      if (msg && !confirm(msg)) return;
+      var m = document.getElementById('act-msg');
+      if (reboot) {
+        m.style.color = '#e67e22';
+        m.textContent = 'Rebooting...';
+        fetch(url, {method: 'POST'});
+        return;
+      }
+      fetch(url, {method: 'POST'})
+        .then(function(){ location.reload(); })
+        .catch(function(){ m.style.color = 'red'; m.textContent = 'Request failed'; });
+    }
+  </script>
+</body>
+</html>

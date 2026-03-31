@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>OTA Update</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: monospace; padding: 16px; max-width: 600px; margin: 0 auto; }
+    .btn { background: #2980b9; color: #fff; border: none; padding: 10px 20px;
+           font-family: monospace; cursor: pointer; border-radius: 3px; margin-top: 16px; }
+    #status { margin-top: 16px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>OTA Firmware Update</h1>
+  <p><a href="/">&#8592; Dashboard</a></p>
+  <p>Current version: <b id="ver">...</b></p>
+  <form id="uf" enctype="multipart/form-data">
+    <input type="file" name="firmware" accept=".bin" required>
+    <br><button type="submit" class="btn">Upload &amp; Flash</button>
+  </form>
+  <div id="status"></div>
+  <script>
+    fetch('/api/system').then(r => r.json()).then(function(s) {
+      document.getElementById('ver').textContent = s.version;
+    });
+
+    document.getElementById('uf').onsubmit = function(e) {
+      e.preventDefault();
+      var f = this.querySelector('input[type=file]').files[0];
+      if (!f) return;
+      document.getElementById('status').textContent = 'Uploading...';
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/ota');
+      xhr.onload = function() {
+        document.getElementById('status').textContent =
+          xhr.status === 200 ? 'Success! Rebooting...' : 'Error: ' + xhr.responseText;
+      };
+      xhr.send(f);
+    };
+  </script>
+</body>
+</html>

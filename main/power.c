@@ -1,4 +1,4 @@
-// power.c — Power state machine (staging disabled; always MOVING rate).
+// power.c — Power state machine with progressive staging and deep sleep.
 
 #include "power.h"
 #include "config.h"
@@ -28,7 +28,7 @@ static uint32_t s_stationary_ms    = 0;
 #define MOTION_CONFIRM_TICKS  2
 #define LOCK_MOTION_CONFIRM   3
 static uint8_t s_motion_count    = 0;
-//static uint8_t s_fast_motion     = 0;
+static uint8_t s_fast_motion     = 0;
 static bool    s_was_stationary  = false;
 
 // Position lock / stationary timing
@@ -37,7 +37,7 @@ static TickType_t s_stationary_since  = 0;
 
 // Grace period: minimum uptime before allowing deep sleep re-entry (60 s)
 #define DEEP_SLEEP_GRACE_MS 60000
-//static TickType_t s_boot_tick = 0;
+static TickType_t s_boot_tick = 0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,8 +73,9 @@ void power_init(void)
     s_rtc_state         = POWER_STATE_MOVING;
     s_rtc_stationary_ms = 0;
     s_stationary_since  = xTaskGetTickCount();
+    s_boot_tick         = xTaskGetTickCount();
     s_was_stationary    = false;
-    ESP_LOGI(TAG, "Power staging disabled — always MOVING rate (%lu ms)",
+    ESP_LOGI(TAG, "Power init — log interval %lu ms",
              (unsigned long)cfg->log_moving_ms);
 }
 
@@ -83,7 +84,9 @@ uint32_t power_get_log_interval_ms(void) { return s_log_interval_ms; }
 
 bool power_deep_sleep_ready(void)
 {
-    return false;   // staging disabled — deep sleep never triggered automatically
+    if (s_state != POWER_STATE_STAGE3) return false;
+    uint32_t uptime_ms = (uint32_t)((xTaskGetTickCount() - s_boot_tick) * portTICK_PERIOD_MS);
+    return uptime_ms >= DEEP_SLEEP_GRACE_MS;
 }
 
 bool power_is_static(const gps_data_t *gps, const imu_data_t *imu)
@@ -112,19 +115,15 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
 {
     const tracker_config_t *cfg = config_get();
 
-    //float am = sqrtf(imu->accel_x*imu->accel_x + imu->accel_y*imu->accel_y +
-                     //imu->accel_z*imu->accel_z);
-    //float gm = sqrtf(imu->gyro_x*imu->gyro_x + imu->gyro_y*imu->gyro_y +
-                     //imu->gyro_z*imu->gyro_z);
+    // Compute IMU magnitudes once; used for both static check and diagnostics.
+    float am = sqrtf(imu->accel_x*imu->accel_x + imu->accel_y*imu->accel_y + imu->accel_z*imu->accel_z);
+    float gm = sqrtf(imu->gyro_x*imu->gyro_x   + imu->gyro_y*imu->gyro_y   + imu->gyro_z*imu->gyro_z);
+    bool imu_stat = (fabsf(am - 1.0f) < cfg->imu_accel_dev) && (gm < cfg->imu_gyro_dps);
 
-    //bool imu_stat = (fabsf(am - 1.0f) < cfg->imu_accel_dev) && (gm < cfg->imu_gyro_dps);
-    //bool gps_stat = !gps->valid || (gps->speed < cfg->gps_static_kmh);
-    //bool imu_only = gps_is_position_locked() || (s_state >= POWER_STATE_STAGE2);
-    //bool stationary = imu_stat && (imu_only || gps_stat);
-
-    if (imu_is_static(imu)){//} && gps_stat) {
+    if (imu_stat) {
         s_stationary_ms += s_log_interval_ms;
         s_motion_count = 0;
+        s_fast_motion  = 0;
 
         // Position lock evaluation
         if (!gps_is_position_locked()) {
@@ -137,46 +136,93 @@ void power_evaluate(const gps_data_t *gps, const imu_data_t *imu,
 
         power_state_t old = s_state;
 
-        if (s_stationary_ms >= cfg->stage3_thresh_ms && s_state != POWER_STATE_STAGE3) {
+        // Enforce sequential stage progression: each stage can only be entered
+        // from the immediately preceding stage.  This prevents a single large
+        // log-tick (at Stage 1's 60 s interval) from overshooting Stage 2 and
+        // jumping directly to Stage 3 when thresholds are close together.
+        if (s_state == POWER_STATE_STAGE2 && s_stationary_ms >= cfg->stage3_thresh_ms) {
             s_state = POWER_STATE_STAGE3;
             s_log_interval_ms = cfg->log_stage3_ms;
             s_rtc_state        = s_state;
             s_rtc_stationary_ms = s_stationary_ms;
             log_transition(old, s_state);
-        } else if (s_stationary_ms >= cfg->stage2_thresh_ms && s_state < POWER_STATE_STAGE2) {
+        } else if (s_state == POWER_STATE_STAGE1 && s_stationary_ms >= cfg->stage2_thresh_ms) {
             s_state = POWER_STATE_STAGE2;
             s_log_interval_ms = cfg->log_stage2_ms;
             log_transition(old, s_state);
-        } else if (s_stationary_ms >= cfg->stage1_thresh_ms && s_state < POWER_STATE_STAGE1) {
+        } else if (s_state == POWER_STATE_MOVING && s_stationary_ms >= cfg->stage1_thresh_ms) {
             s_state = POWER_STATE_STAGE1;
             s_log_interval_ms = cfg->log_stage1_ms;
             log_transition(old, s_state);
         }
 
+        // Log progress toward Stage 3 every tick while staged.
+        if (s_state >= POWER_STATE_STAGE1) {
+            ESP_LOGI(TAG, "Stationary %lu / %lu ms — state %d",
+                     (unsigned long)s_stationary_ms,
+                     (unsigned long)cfg->stage3_thresh_ms,
+                     (int)s_state);
+        }
+
         s_was_stationary = true;
     } else {
-        // Require several consecutive moving samples before releasing lock
-        // so brief vibration spikes do not break it.
+        // Log what is causing the motion detection to fail so we can tune thresholds.
+        ESP_LOGW(TAG, "Motion tick: |a|=%.3f (dev=%.3f thresh=%.3f) |g|=%.2f (thresh=%.2f)",
+                 am, fabsf(am - 1.0f), cfg->imu_accel_dev, gm, cfg->imu_gyro_dps);
+
         s_motion_count++;
         if (s_motion_count >= LOCK_MOTION_CONFIRM) {
             s_motion_count   = 0;
+            s_fast_motion    = 0;
             s_was_stationary = false;
             if (gps_is_position_locked()) {
                 gps_unlock_position();
             }
             s_stationary_since = xTaskGetTickCount();
+
+            // Reset power stage back to MOVING on confirmed motion.
+            if (s_state != POWER_STATE_MOVING) {
+                power_state_t prev = s_state;
+                s_state           = POWER_STATE_MOVING;
+                s_log_interval_ms = cfg->log_moving_ms;
+                s_rtc_state       = POWER_STATE_MOVING;
+                s_stationary_ms   = 0;
+                log_transition(prev, POWER_STATE_MOVING);
+            }
         }
     }
 
-    // Staging disabled — log interval is always log_moving_ms.
     *interval_ms = s_log_interval_ms;
 }
 
 void power_fast_motion_check(const gps_data_t *gps, const imu_data_t *imu,
                              uint32_t *interval_ms)
 {
-    (void)gps; (void)imu; (void)interval_ms;
-    // No-op — state is always MOVING; no stage to exit.
+    (void)gps;
+    // Already at fastest rate — nothing to do.
+    if (s_state == POWER_STATE_MOVING) return;
+
+    if (!imu_is_static(imu)) {
+        // Require LOCK_MOTION_CONFIRM consecutive fast-rate motion samples
+        // (LOCK_MOTION_CONFIRM * GPS_SAMPLE_PERIOD_MS debounce) before resetting
+        // the stage, so single-sample noise spikes don’t kick us out of Stage 2/3.
+        s_fast_motion++;
+        if (s_fast_motion >= LOCK_MOTION_CONFIRM) {
+            s_fast_motion = 0;
+            const tracker_config_t *cfg = config_get();
+            power_state_t old = s_state;
+            s_state           = POWER_STATE_MOVING;
+            s_log_interval_ms = cfg->log_moving_ms;
+            s_rtc_state       = POWER_STATE_MOVING;
+            s_stationary_ms   = 0;
+            s_motion_count    = 0;
+            if (gps_is_position_locked()) gps_unlock_position();
+            *interval_ms = cfg->log_moving_ms;
+            log_transition(old, POWER_STATE_MOVING);
+        }
+    } else {
+        s_fast_motion = 0;
+    }
 }
 
 void power_enter_deep_sleep(void)

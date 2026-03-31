@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_spiffs.h"
 
 static const char *TAG = "WEBSERVER";
 
@@ -48,107 +49,60 @@ extern gps_data_t  g_current_gps;
 extern imu_data_t  g_current_imu;
 extern char        g_own_mac_str[5];
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── SPIFFS helpers ──────────────────────────────────────────────────────────
 
-static void emit_file_row(httpd_req_t *req, const char *display, const char *path)
+static const char *mime_type(const char *path)
 {
-    struct stat st;
-    if (stat(path, &st) != 0) return;
-    char buf[640];
-    snprintf(buf, sizeof(buf),
-        "<tr><td><a href='/download?path=%s'>%s</a></td>"
-        "<td style='padding-left:16px;color:#888'>%ld B</td></tr>",
-        path, display, st.st_size);
-    httpd_resp_sendstr_chunk(req, buf);
+    const char *e = strrchr(path, '.');
+    if (!e) return "application/octet-stream";
+    if (strcmp(e, ".html") == 0) return "text/html";
+    if (strcmp(e, ".css")  == 0) return "text/css";
+    if (strcmp(e, ".js")   == 0) return "application/javascript";
+    if (strcmp(e, ".json") == 0) return "application/json";
+    if (strcmp(e, ".ico")  == 0) return "image/x-icon";
+    if (strcmp(e, ".png")  == 0) return "image/png";
+    return "application/octet-stream";
+}
+
+static esp_err_t serve_spiffs(httpd_req_t *req, const char *filename)
+{
+    char path[80];
+    snprintf(path, sizeof(path), "/spiffs/%s", filename);
+    FILE *f = fopen(path, "r");
+    if (!f) { httpd_resp_send_404(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, mime_type(path));
+    char buf[512]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        httpd_resp_send_chunk(req, buf, n);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Wildcard fallback: serves any file from SPIFFS by URI path.
+// e.g. GET /style.css -> /spiffs/style.css
+static esp_err_t handle_static_file(httpd_req_t *req)
+{
+    if (strstr(req->uri, "..")) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+        return ESP_FAIL;
+    }
+    char path[520];
+    snprintf(path, sizeof(path), "/spiffs%s", req->uri);
+    FILE *f = fopen(path, "r");
+    if (!f) { httpd_resp_send_404(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, mime_type(path));
+    char buf[512]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        httpd_resp_send_chunk(req, buf, n);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
 }
 
 // ── GET / — Dashboard ────────────────────────────────────────────────────────
 
-static esp_err_t handle_root(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr_chunk(req,
-        "<html><head><title>GPS Tracker v2</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>"
-        "body{font-family:monospace;padding:16px;max-width:700px;margin:0 auto}"
-        "h1{border-bottom:1px solid #ccc;padding-bottom:8px}"
-        "h2{margin-top:24px;color:#444}table{border-collapse:collapse;width:100%}"
-        "td{padding:4px 0}a{color:#0066cc}"
-        ".btn{border:none;padding:8px 16px;font-family:monospace;font-size:14px;"
-        "cursor:pointer;border-radius:3px;margin-right:8px;color:#fff}"
-        ".action{background:#2980b9}.action:hover{background:#1a6fa0}"
-        ".warn{background:#e67e22}.warn:hover{background:#ca6f1e}"
-        ".danger{background:#c0392b}.danger:hover{background:#a93226}"
-        "</style></head><body>");
-
-    // Header + device info
-    char header[256];
-    snprintf(header, sizeof(header),
-        "<h1>GPS Tracker v2</h1>"
-        "<p style='color:#555;margin-top:0'>MAC: <b>%s</b> | "
-        "<a href='/map'>Live Map</a> | "
-        "<a href='/config'>Config</a> | "
-        "<a href='/ota'>OTA Update</a></p>",
-        g_own_mac_str[0] ? g_own_mac_str : "??");
-    httpd_resp_sendstr_chunk(req, header);
-
-    // Sync files
-    httpd_resp_sendstr_chunk(req, "<h2>Sync Files</h2><table>");
-    emit_file_row(req, "sync_data.csv", CSV_DATA_FILE);
-    emit_file_row(req, "sync_merged.csv", CSV_MERGED_FILE);
-    httpd_resp_sendstr_chunk(req, "</table>");
-
-    // Backup files
-    httpd_resp_sendstr_chunk(req, "<h2>Backup Files</h2><table>");
-    DIR *d = opendir(SD_MOUNT_POINT);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            size_t len = strlen(ent->d_name);
-            if (len > 4 && strcmp(ent->d_name + len - 4, ".bak") == 0) {
-                char full[272];
-                snprintf(full, sizeof(full), SD_MOUNT_POINT "/%s", ent->d_name);
-                emit_file_row(req, ent->d_name, full);
-            }
-        }
-        closedir(d);
-    }
-    httpd_resp_sendstr_chunk(req, "</table>");
-
-    // Connection log
-    httpd_resp_sendstr_chunk(req, "<h2>Connection Log</h2><table>");
-    emit_file_row(req, "connections.csv", CONNECTIONS_LOG_FILE);
-    httpd_resp_sendstr_chunk(req, "</table>");
-
-    // Debug log
-    httpd_resp_sendstr_chunk(req, "<h2>Debug Log</h2><table>");
-    emit_file_row(req, "debug.log (current)", DEBUG_LOG_FILE);
-    emit_file_row(req, "debug_old.log (previous)", DEBUG_LOG_OLD_FILE);
-    httpd_resp_sendstr_chunk(req, "</table>");
-
-    // Actions
-    httpd_resp_sendstr_chunk(req,
-        "<h2>Actions</h2>"
-        "<form method='POST' action='/reupload_bak' style='display:inline'>"
-        "<button class='btn action'>Re-upload backups</button></form>"
-        "<form method='POST' action='/clear_bak' style='display:inline' "
-        "onsubmit=\"return confirm('Delete all .bak files?');\">"
-        "<button class='btn warn'>Clear backups</button></form>"
-        "<form method='POST' action='/clear' style='display:inline' "
-        "onsubmit=\"return confirm('Clear ALL data files?');\">"
-        "<button class='btn danger'>Clear all data</button></form>"
-        "<form method='POST' action='/clear_log' style='display:inline;margin-left:8px' "
-        "onsubmit=\"return confirm('Delete debug log files?');\">"
-        "<button class='btn warn'>Clear debug log</button></form>"
-        "<form method='POST' action='/reboot' style='display:inline;margin-left:16px' "
-        "onsubmit=\"return confirm('Reboot the device?');\">"
-        "<button class='btn warn'>Reboot</button></form>");
-
-    httpd_resp_sendstr_chunk(req, "</body></html>");
-    httpd_resp_sendstr_chunk(req, NULL);
-    return ESP_OK;
-}
+static esp_err_t handle_root(httpd_req_t *req) { return serve_spiffs(req, "index.html"); }
 
 // ── GET /download ────────────────────────────────────────────────────────────
 
@@ -486,213 +440,13 @@ static esp_err_t handle_api_config_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-// ── GET /map — Live GPS map ──────────────────────────────────────────────────
+// ── GET /map, /config, /ota — served from SPIFFS ──────────────────────────────
 
-static esp_err_t handle_map(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req,
-        "<!DOCTYPE html><html><head><title>GPS Map</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>"
-        "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>"
-        "<style>#map{height:100vh;width:100%}body{margin:0}"
-        "#info{position:absolute;top:10px;right:10px;z-index:1000;"
-        "background:rgba(255,255,255,0.9);padding:10px;border-radius:5px;"
-        "font-family:monospace;font-size:13px}</style></head><body>"
-        "<div id='info'>Loading GPS...</div>"
-        "<div id='map'></div>"
-        "<script>"
-        "var map=L.map('map').setView([0,0],2);"
-        "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{"
-        "attribution:'&copy; OpenStreetMap'}).addTo(map);"
-        "var marker=null,first=true;"
-        "function update(){"
-        "fetch('/api/gps').then(r=>r.json()).then(d=>{"
-        "if(!d.valid)return;"
-        "var ll=[d.lat,d.lon];"
-        "if(!marker){marker=L.circleMarker(ll,{radius:8,color:'#e74c3c',fillOpacity:0.8}).addTo(map);"
-        "}else{marker.setLatLng(ll);}"
-        "if(first){map.setView(ll,16);first=false;}"
-        "document.getElementById('info').innerHTML="
-        "'<b>'+d.lat.toFixed(6)+', '+d.lon.toFixed(6)+'</b><br>'"
-        "+'Speed: '+d.speed.toFixed(1)+' km/h<br>'"
-        "+'Alt: '+d.alt.toFixed(0)+' m<br>'"
-        "+'Sats: '+d.sats+' HDOP: '+d.hdop.toFixed(1);"
-        "}).catch(()=>{});}"
-        "setInterval(update,2000);update();"
-        "</script></body></html>");
-    return ESP_OK;
-}
+static esp_err_t handle_map(httpd_req_t *req)         { return serve_spiffs(req, "map.html"); }
 
-// ── GET /config — Config editor page ─────────────────────────────────────────
+static esp_err_t handle_config_page(httpd_req_t *req) { return serve_spiffs(req, "config.html"); }
 
-static esp_err_t handle_config_page(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-
-    httpd_resp_sendstr_chunk(req,
-        "<!DOCTYPE html><html><head><title>Config</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>"
-        "body{font-family:monospace;padding:16px;max-width:700px;margin:0 auto}"
-        "h2{border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:24px}"
-        "label{display:block;margin:8px 0 2px;font-size:13px;color:#555}"
-        "input{width:100%;padding:6px;font-family:monospace;box-sizing:border-box}"
-        ".row{display:flex;gap:8px}.row input{flex:1}"
-        ".btn{background:#2980b9;color:#fff;border:none;padding:10px 20px;"
-        "font-family:monospace;cursor:pointer;border-radius:3px;margin-top:16px}"
-        ".btn-danger{background:#c0392b}"
-        "#msg{margin-top:8px;font-weight:bold}"
-        "</style></head><body>"
-        "<h1>Configuration</h1>"
-        "<p><a href='/'>&#8592; Dashboard</a></p>"
-        "<div id='form'>Loading...</div>"
-        "<div id='msg'></div>");
-
-    httpd_resp_sendstr_chunk(req,
-        "<script>"
-        "function F(n,l,v,t){t=t||'text';"
-        "return '<label>'+l+'</label>"
-        "<input name=\"'+n+'\" type=\"'+t+'\" value=\"'+(v!=null?v:'')+'\" step=\"any\">';}"
-        "function N(n,l,v){return F(n,l,v,'number');}"
-        "fetch('/api/config').then(r=>r.json()).then(function(c){"
-        "var h='<form id=\"cf\">';"
-
-        /* ── WiFi ── */
-        "h+='<h2>WiFi Networks</h2>';"
-        "for(var i=0;i<4;i++){"
-        "var s=c.wifi_aps&&c.wifi_aps[i]?c.wifi_aps[i]:{ssid:\"\",has_pass:false};"
-        "h+='<div class=\"row\">'+"
-        "'<input name=\"wifi_ssid_'+i+'\" placeholder=\"SSID '+(i+1)+'\" value=\"'+s.ssid+'\">'+"
-        "'<input name=\"wifi_pass_'+i+'\" type=\"password\" placeholder=\"'+"
-        "(s.has_pass?'(unchanged)':'Password')+'\">'+"
-        "'</div>';}"
-        "h+=N('wifi_max_retry','Max Retry',c.wifi_max_retry);"
-
-        /* ── Upload ── */
-        "h+='<h2>Upload</h2>';"
-        "h+=F('upload_url','Upload URL',c.upload_url);"
-
-        /* ── Timezone ── */
-        "h+='<h2>Timezone</h2>';"
-        "h+=F('timezone','POSIX TZ String',c.timezone);");
-
-    httpd_resp_sendstr_chunk(req,
-        /* ── GPS Quality ── */
-        "h+='<h2>GPS Quality Filters</h2>';"
-        "h+=N('gps_max_hdop','Max HDOP',c.gps_max_hdop);"
-        "h+=N('gps_min_sv','Min Satellites',c.gps_min_sv);"
-        "h+=N('gps_outlier_m','Outlier Distance (m)',c.gps_outlier_m);"
-        "h+=N('gps_ema_alpha','EMA Alpha',c.gps_ema_alpha);"
-
-        /* ── Motion Detection ── */
-        "h+='<h2>Motion Detection</h2>';"
-        "h+=N('gps_static_kmh','Static Speed (km/h)',c.gps_static_kmh);"
-        "h+=N('imu_accel_dev','Accel Deviation (g)',c.imu_accel_dev);"
-        "h+=N('imu_gyro_dps','Gyro Threshold (deg/s)',c.imu_gyro_dps);"
-
-        /* ── Logging Intervals ── */
-        "h+='<h2>Logging Intervals (ms)</h2>';"
-        "h+=N('log_moving_ms','Moving',c.log_moving_ms);"
-        "h+=N('log_stage1_ms','Stage 1',c.log_stage1_ms);"
-        "h+=N('log_stage2_ms','Stage 2',c.log_stage2_ms);"
-        "h+=N('log_stage3_ms','Stage 3',c.log_stage3_ms);");
-
-    httpd_resp_sendstr_chunk(req,
-        /* ── Power Stage Thresholds ── */
-        "h+='<h2>Power Stage Thresholds (ms)</h2>';"
-        "h+=N('stage1_thresh_ms','Stage 1 Entry',c.stage1_thresh_ms);"
-        "h+=N('stage2_thresh_ms','Stage 2 Entry',c.stage2_thresh_ms);"
-        "h+=N('stage3_thresh_ms','Stage 3 Entry',c.stage3_thresh_ms);"
-
-        /* ── GPS Re-lock Budgets ── */
-        "h+='<h2>GPS Re-lock Budgets (ms)</h2>';"
-        "h+=N('relock_stage1_ms','Stage 1',c.relock_stage1_ms);"
-        "h+=N('relock_stage2_ms','Stage 2',c.relock_stage2_ms);"
-        "h+=N('relock_stage3_ms','Stage 3',c.relock_stage3_ms);"
-
-        /* ── Display ── */
-        "h+='<h2>Display</h2>';"
-        "h+=N('lcd_timeout_sec','LCD Timeout (sec)',c.lcd_timeout_sec);"
-
-        /* ── Sync ── */
-        "h+='<h2>Sync State Machine</h2>';"
-        "h+=N('sync_search_max','Search Iterations Max',c.sync_search_max);"
-        "h+=N('sync_upload_interval_s','Upload Interval (sec)',c.sync_upload_interval_s);");
-
-    httpd_resp_sendstr_chunk(req,
-        /* ── Buttons + submit handler ── */
-        "h+='<br><button type=\"submit\" class=\"btn\">Save</button>';"
-        "h+=' <button type=\"button\" class=\"btn btn-danger\" onclick=\"resetCfg()\">Factory Reset</button>';"
-        "h+='</form>';"
-        "document.getElementById('form').innerHTML=h;"
-        "document.getElementById('cf').onsubmit=function(e){"
-        "e.preventDefault();"
-        "var fd=new URLSearchParams(new FormData(this));"
-        "fetch('/api/config',{method:'POST',body:fd}).then(r=>r.json()).then(function(d){"
-        "var m=document.getElementById('msg');"
-        "m.textContent=d.status==='ok'?'Saved! Some changes need reboot.':'Error: '+JSON.stringify(d);"
-        "m.style.color=d.status==='ok'?'green':'red';"
-        "});};});"
-
-        "function resetCfg(){"
-        "if(!confirm('Reset ALL settings to factory defaults?'))return;"
-        "fetch('/api/reset_config',{method:'POST'}).then(r=>r.json()).then(function(){"
-        "document.getElementById('msg').textContent='Reset to defaults.';"
-        "document.getElementById('msg').style.color='orange';"
-        "setTimeout(function(){location.reload();},1000);"
-        "});}"
-        "</script></body></html>");
-
-    httpd_resp_sendstr_chunk(req, NULL);
-    return ESP_OK;
-}
-
-// ── GET /ota — OTA upload page ───────────────────────────────────────────────
-
-static esp_err_t handle_ota_page(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-    const esp_app_desc_t *app = esp_app_get_description();
-
-    httpd_resp_sendstr_chunk(req,
-        "<!DOCTYPE html><html><head><title>OTA Update</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>body{font-family:monospace;padding:16px;max-width:600px;margin:0 auto}"
-        ".btn{background:#2980b9;color:#fff;border:none;padding:10px 20px;"
-        "font-family:monospace;cursor:pointer;border-radius:3px;margin-top:16px}"
-        "#status{margin-top:16px;font-weight:bold}</style></head><body>"
-        "<h1>OTA Firmware Update</h1>"
-        "<p><a href='/'>&#8592; Dashboard</a></p>");
-
-    char ver_line[128];
-    snprintf(ver_line, sizeof(ver_line),
-        "<p>Current version: <b>%s</b></p>", app->version);
-    httpd_resp_sendstr_chunk(req, ver_line);
-
-    httpd_resp_sendstr_chunk(req,
-        "<form id='uf' enctype='multipart/form-data'>"
-        "<input type='file' name='firmware' accept='.bin' required>"
-        "<br><button type='submit' class='btn'>Upload &amp; Flash</button>"
-        "</form><div id='status'></div>"
-        "<script>"
-        "document.getElementById('uf').onsubmit=function(e){"
-        "e.preventDefault();"
-        "var f=this.querySelector('input[type=file]').files[0];"
-        "if(!f)return;"
-        "document.getElementById('status').textContent='Uploading...';"
-        "var xhr=new XMLHttpRequest();"
-        "xhr.open('POST','/ota');"
-        "xhr.onload=function(){"
-        "document.getElementById('status').textContent="
-        "xhr.status===200?'Success! Rebooting...':'Error: '+xhr.responseText;};"
-        "xhr.send(f);};"
-        "</script></body></html>");
-
-    httpd_resp_sendstr_chunk(req, NULL);
-    return ESP_OK;
-}
+static esp_err_t handle_ota_page(httpd_req_t *req)    { return serve_spiffs(req, "ota.html"); }
 
 // ── POST /ota — Receive firmware binary ──────────────────────────────────────
 
@@ -793,13 +547,117 @@ static esp_err_t handle_clear_log(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── GET /api/files — JSON list of data files for dashboard ──────────────────
+
+static esp_err_t handle_api_files(httpd_req_t *req)
+{
+    char *json = malloc(4096);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int off = 0;
+    struct stat st;
+
+    off += snprintf(json + off, 4096 - off, "{\"sections\":[");
+
+    // Sync files
+    off += snprintf(json + off, 4096 - off, "{\"title\":\"Sync Files\",\"files\":[");
+    bool first = true;
+    const char *sync[][2] = {
+        {"sync_data.csv",   CSV_DATA_FILE},
+        {"sync_merged.csv", CSV_MERGED_FILE},
+    };
+    for (int i = 0; i < 2; i++) {
+        if (stat(sync[i][1], &st) == 0) {
+            if (!first) off += snprintf(json + off, 4096 - off, ",");
+            off += snprintf(json + off, 4096 - off,
+                "{\"name\":\"%s\",\"path\":\"%s\",\"size\":%ld}",
+                sync[i][0], sync[i][1], st.st_size);
+            first = false;
+        }
+    }
+    off += snprintf(json + off, 4096 - off, "]}");
+
+    // Backup files
+    off += snprintf(json + off, 4096 - off, ",{\"title\":\"Backup Files\",\"files\":[");
+    first = true;
+    DIR *d = opendir(SD_MOUNT_POINT);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t len = strlen(ent->d_name);
+            if (len > 4 && strcmp(ent->d_name + len - 4, ".bak") == 0) {
+                char full[272];
+                snprintf(full, sizeof(full), SD_MOUNT_POINT "/%s", ent->d_name);
+                if (stat(full, &st) == 0) {
+                    if (!first) off += snprintf(json + off, 4096 - off, ",");
+                    off += snprintf(json + off, 4096 - off,
+                        "{\"name\":\"%s\",\"path\":\"%s\",\"size\":%ld}",
+                        ent->d_name, full, st.st_size);
+                    first = false;
+                }
+            }
+        }
+        closedir(d);
+    }
+    off += snprintf(json + off, 4096 - off, "]}");
+
+    // Connection log
+    off += snprintf(json + off, 4096 - off, ",{\"title\":\"Connection Log\",\"files\":[");
+    if (stat(CONNECTIONS_LOG_FILE, &st) == 0)
+        off += snprintf(json + off, 4096 - off,
+            "{\"name\":\"connections.csv\",\"path\":\"%s\",\"size\":%ld}",
+            CONNECTIONS_LOG_FILE, st.st_size);
+    off += snprintf(json + off, 4096 - off, "]}");
+
+    // Debug log
+    off += snprintf(json + off, 4096 - off, ",{\"title\":\"Debug Log\",\"files\":[");
+    first = true;
+    const char *logs[][2] = {
+        {"debug.log (current)",      DEBUG_LOG_FILE},
+        {"debug_old.log (previous)", DEBUG_LOG_OLD_FILE},
+    };
+    for (int i = 0; i < 2; i++) {
+        if (stat(logs[i][1], &st) == 0) {
+            if (!first) off += snprintf(json + off, 4096 - off, ",");
+            off += snprintf(json + off, 4096 - off,
+                "{\"name\":\"%s\",\"path\":\"%s\",\"size\":%ld}",
+                logs[i][0], logs[i][1], st.st_size);
+            first = false;
+        }
+    }
+    off += snprintf(json + off, 4096 - off, "]}");
+
+    off += snprintf(json + off, 4096 - off, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    free(json);
+    return ESP_OK;
+}
+
 // ── Server start / stop ──────────────────────────────────────────────────────
 
 httpd_handle_t webserver_start(void)
 {
+    // Mount SPIFFS for web assets
+    esp_vfs_spiffs_conf_t spiffs_conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 8,
+        .format_if_mount_failed = false,
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&spiffs_conf);
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "SPIFFS mounted at /spiffs");
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 19;
+    config.max_uri_handlers = 21;
     config.stack_size = 8192;
+    config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -820,6 +678,7 @@ httpd_handle_t webserver_start(void)
         { "/api/system",    HTTP_GET,  handle_api_system,    NULL },
         { "/api/config",    HTTP_GET,  handle_api_config_get, NULL },
         { "/api/config",    HTTP_POST, handle_api_config_post, NULL },
+        { "/api/files",     HTTP_GET,  handle_api_files,      NULL },
         { "/api/reset_config", HTTP_POST, handle_reset_config, NULL },
         { "/reboot",          HTTP_POST, handle_reboot,        NULL },
         { "/clear_log",       HTTP_POST, handle_clear_log,     NULL },
@@ -831,6 +690,8 @@ httpd_handle_t webserver_start(void)
         { "/config",        HTTP_GET,  handle_config_page,   NULL },
         { "/ota",           HTTP_GET,  handle_ota_page,      NULL },
         { "/ota",           HTTP_POST, handle_ota_upload,    NULL },
+        // Wildcard fallback: serves static files (CSS, JS, etc.) from SPIFFS
+        { "/*",             HTTP_GET,  handle_static_file,   NULL },
     };
 
     for (int i = 0; i < (int)(sizeof(uris) / sizeof(uris[0])); i++)

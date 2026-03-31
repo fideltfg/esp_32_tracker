@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Config</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: monospace; padding: 16px; max-width: 700px; margin: 0 auto; }
+    h2 { border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 24px; }
+    label { display: block; margin: 8px 0 2px; font-size: 13px; color: #555; }
+    input { width: 100%; padding: 6px; font-family: monospace; box-sizing: border-box; }
+    .row { display: flex; gap: 8px; }
+    .row input { flex: 1; }
+    .btn { background: #2980b9; color: #fff; border: none; padding: 10px 20px;
+           font-family: monospace; cursor: pointer; border-radius: 3px; margin-top: 16px; }
+    .btn-danger { background: #c0392b; }
+    #msg { margin-top: 8px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Configuration</h1>
+  <p><a href="/">&#8592; Dashboard</a></p>
+  <div id="form">Loading...</div>
+  <div id="msg"></div>
+  <script>
+    function F(n, l, v, t) {
+      t = t || 'text';
+      return '<label>' + l + '</label>' +
+             '<input name="' + n + '" type="' + t + '" value="' + (v != null ? v : '') + '" step="any">';
+    }
+    function N(n, l, v) { return F(n, l, v, 'number'); }
+
+    fetch('/api/config').then(r => r.json()).then(function(c) {
+      var h = '<form id="cf">';
+
+      // WiFi Networks
+      h += '<h2>WiFi Networks</h2>';
+      for (var i = 0; i < 4; i++) {
+        var s = c.wifi_aps && c.wifi_aps[i] ? c.wifi_aps[i] : { ssid: '', has_pass: false };
+        h += '<div class="row">' +
+             '<input name="wifi_ssid_' + i + '" placeholder="SSID ' + (i + 1) + '" value="' + s.ssid + '">' +
+             '<input name="wifi_pass_' + i + '" type="password" placeholder="' +
+             (s.has_pass ? '(unchanged)' : 'Password') + '">' +
+             '</div>';
+      }
+      h += N('wifi_max_retry', 'Max Retry', c.wifi_max_retry);
+
+      // Upload
+      h += '<h2>Upload</h2>';
+      h += F('upload_url', 'Upload URL', c.upload_url);
+
+      // Timezone
+      h += '<h2>Timezone</h2>';
+      h += F('timezone', 'POSIX TZ String', c.timezone);
+
+      // GPS Quality Filters
+      h += '<h2>GPS Quality Filters</h2>';
+      h += N('gps_max_hdop', 'Max HDOP', c.gps_max_hdop);
+      h += N('gps_min_sv', 'Min Satellites', c.gps_min_sv);
+      h += N('gps_outlier_m', 'Outlier Distance (m)', c.gps_outlier_m);
+      h += N('gps_ema_alpha', 'EMA Alpha', c.gps_ema_alpha);
+
+      // Motion Detection
+      h += '<h2>Motion Detection</h2>';
+      h += N('gps_static_kmh', 'Static Speed (km/h)', c.gps_static_kmh);
+      h += N('imu_accel_dev', 'Accel Deviation (g)', c.imu_accel_dev);
+      h += N('imu_gyro_dps', 'Gyro Threshold (deg/s)', c.imu_gyro_dps);
+
+      // Logging Intervals
+      h += '<h2>Logging Intervals (ms)</h2>';
+      h += N('log_moving_ms', 'Moving', c.log_moving_ms);
+      h += N('log_stage1_ms', 'Stage 1', c.log_stage1_ms);
+      h += N('log_stage2_ms', 'Stage 2', c.log_stage2_ms);
+      h += N('log_stage3_ms', 'Stage 3', c.log_stage3_ms);
+
+      // Power Stage Thresholds
+      h += '<h2>Power Stage Thresholds (ms)</h2>';
+      h += N('stage1_thresh_ms', 'Stage 1 Entry', c.stage1_thresh_ms);
+      h += N('stage2_thresh_ms', 'Stage 2 Entry', c.stage2_thresh_ms);
+      h += N('stage3_thresh_ms', 'Stage 3 Entry', c.stage3_thresh_ms);
+
+      // GPS Re-lock Budgets
+      h += '<h2>GPS Re-lock Budgets (ms)</h2>';
+      h += N('relock_stage1_ms', 'Stage 1', c.relock_stage1_ms);
+      h += N('relock_stage2_ms', 'Stage 2', c.relock_stage2_ms);
+      h += N('relock_stage3_ms', 'Stage 3', c.relock_stage3_ms);
+
+      // Display
+      h += '<h2>Display</h2>';
+      h += N('lcd_timeout_sec', 'LCD Timeout (sec)', c.lcd_timeout_sec);
+
+      // Sync State Machine
+      h += '<h2>Sync State Machine</h2>';
+      h += N('sync_search_max', 'Search Iterations Max', c.sync_search_max);
+      h += N('sync_upload_interval_s', 'Upload Interval (sec)', c.sync_upload_interval_s);
+
+      h += '<br><button type="submit" class="btn">Save</button>';
+      h += '</form>';
+      document.getElementById('form').innerHTML = h;
+
+      document.getElementById('cf').onsubmit = function(e) {
+        e.preventDefault();
+        var fd = new URLSearchParams(new FormData(this));
+        fetch('/api/config', { method: 'POST', body: fd }).then(r => r.json()).then(function(d) {
+          var m = document.getElementById('msg');
+          m.textContent = d.status === 'ok' ? 'Saved! Some changes need reboot.' : 'Error: ' + JSON.stringify(d);
+          m.style.color = d.status === 'ok' ? 'green' : 'red';
+        });
+      };
+    });
+
+  </script>
+</body>
+</html>

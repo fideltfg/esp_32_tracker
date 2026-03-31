@@ -4,7 +4,7 @@ idf_component_register(SRCS "serial_log.c" "main.c" "webserver.c" "upload.c" "po
                        INCLUDE_DIRS "."
                        REQUIRES driver nvs_flash esp_wifi esp_http_server fatfs sdmmc
                                 esp_http_client esp_netif esp_event esp_timer log
-                                app_update esp_https_ota)
+                                app_update esp_https_ota spiffs)
 
-
+spiffs_create_partition_image(storage ../spiffs_data FLASH_IN_PROJECT)
 

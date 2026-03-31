@@ -401,6 +401,9 @@ static void sync_state_machine_task(void *arg)
             }
 
             if (!power_is_static(&g_current_gps, &g_current_imu)) break;
+            // Once Stage 3 grace period is satisfied, exit the sync loop after
+            // this round rather than burning through all sync_search_max iters.
+            if (power_deep_sleep_ready()) break;
             search_time++;
             vTaskDelay(pdMS_TO_TICKS(100));
         }
